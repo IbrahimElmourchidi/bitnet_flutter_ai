@@ -1,0 +1,54 @@
+# ffigen.yaml
+#
+# Generates Dart FFI bindings from native/bitnet_bridge.h.
+#
+# Run after updating the header:
+#   dart run ffigen --config ffigen.yaml
+#
+# The output file (lib/src/ffi/bindings.dart) is committed to source control
+# so that package consumers do not need a C compiler or clang installed.
+
+name: BitNetBindings
+description: 'Auto-generated Dart FFI bindings for bitnet_bridge.h. DO NOT EDIT manually.'
+
+output: 'lib/src/ffi/bindings.dart'
+
+headers:
+  entry-points:
+    - 'native/bitnet_bridge.h'
+
+# Require clang to parse as C11 so stdint.h resolves correctly.
+compiler-opts:
+  - '-std=c11'
+
+# Only bind the symbols we own. Exclude everything from system headers.
+functions:
+  include:
+    - 'bn_init'
+    - 'bn_free'
+    - 'bn_free_string'
+    - 'bn_prompt'
+    - 'bn_next_token'
+    - 'bn_context_size'
+    - 'bn_meta'
+
+structs:
+  include:
+    - 'BnContext'
+
+# Suppress generation of typedefs and enums from system includes.
+typedefs:
+  exclude:
+    - '.*'
+
+enums:
+  exclude:
+    - '.*'
+
+# Silence verbose ffigen output during CI.
+silence-enum-warning: true
+
+preamble: |
+  // AUTO-GENERATED FILE. DO NOT EDIT.
+  // Run: dart run ffigen --config ffigen.yaml
+  // ignore_for_file: type=lint, always_use_package_imports

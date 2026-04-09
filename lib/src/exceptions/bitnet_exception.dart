@@ -1,0 +1,94 @@
+/// Base exception for all bitnet_flutter_ai errors.
+sealed class BitNetException implements Exception {
+  final String message;
+  const BitNetException(this.message);
+
+  @override
+  String toString() => 'BitNetException($runtimeType): $message';
+}
+
+/// Device physical RAM is below the 3072 MB minimum required by BitNet 2B-4T.
+final class BitNetUnsupportedDeviceException extends BitNetException {
+  final int availableRamBytes;
+
+  const BitNetUnsupportedDeviceException(this.availableRamBytes)
+      : super(
+          'Device RAM (${availableRamBytes ~/ (1024 * 1024)} MB) is below '
+          'the 3072 MB minimum required by BitNet 2B-4T.',
+        );
+}
+
+/// The current platform is not supported (e.g. Safari without WASM threads).
+final class BitNetUnsupportedPlatformException extends BitNetException {
+  const BitNetUnsupportedPlatformException(super.message);
+}
+
+/// The native shared library could not be loaded (DynamicLibrary.open failed).
+final class BitNetLibraryLoadException extends BitNetException {
+  const BitNetLibraryLoadException(super.message);
+}
+
+/// The native context initialisation failed (bn_init returned NULL).
+final class BitNetInitException extends BitNetException {
+  /// Error string from the native layer, if available.
+  final String? nativeError;
+
+  const BitNetInitException({required String message, this.nativeError})
+      : super(message);
+
+  @override
+  String toString() =>
+      'BitNetInitException: $message'
+      '${nativeError != null ? ' (native: $nativeError)' : ''}';
+}
+
+/// A native inference call (bn_prompt or bn_next_token) returned an error.
+final class BitNetInferenceException extends BitNetException {
+  /// Error string from the native layer, if available.
+  final String? nativeError;
+
+  const BitNetInferenceException({required String message, this.nativeError})
+      : super(message);
+
+  @override
+  String toString() =>
+      'BitNetInferenceException: $message'
+      '${nativeError != null ? ' (native: $nativeError)' : ''}';
+}
+
+/// The downloaded GGUF file SHA-256 does not match the expected hash.
+/// The corrupt file is deleted before this exception is thrown.
+final class BitNetHashMismatchException extends BitNetException {
+  final String expectedHash;
+  final String actualHash;
+
+  BitNetHashMismatchException(this.expectedHash, this.actualHash)
+      : super(
+          'Model file SHA-256 mismatch. '
+          'Expected: $expectedHash. Got: $actualHash. '
+          'The file has been deleted and will be re-downloaded on the next call.',
+        );
+}
+
+/// A network error occurred during model download.
+final class BitNetDownloadException extends BitNetException {
+  final int? httpStatusCode;
+
+  const BitNetDownloadException(super.message, {this.httpStatusCode});
+
+  @override
+  String toString() =>
+      'BitNetDownloadException: $message'
+      '${httpStatusCode != null ? ' (HTTP $httpStatusCode)' : ''}';
+}
+
+/// [BitNetEngine.generate] was called before [BitNetEngine.load].
+final class BitNetNotLoadedException extends BitNetException {
+  const BitNetNotLoadedException()
+      : super('BitNetEngine.load() must be called and awaited before generate().');
+}
+
+/// The inference isolate exited unexpectedly.
+final class BitNetIsolateException extends BitNetException {
+  const BitNetIsolateException(super.message);
+}
