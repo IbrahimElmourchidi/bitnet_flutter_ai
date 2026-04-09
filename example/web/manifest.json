@@ -1,0 +1,12 @@
+{
+    "name": "BitNet Flutter AI",
+    "short_name": "BitNet",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#FFFFFF",
+    "theme_color": "#6750A4",
+    "description": "On-device LLM inference with Microsoft BitNet b1.58 2B-4T.",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false,
+    "icons": []
+}

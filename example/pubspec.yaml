@@ -1,0 +1,17 @@
+name: bitnet_flutter_ai_example
+description: Demonstrates bitnet_flutter_ai — on-device BitNet b1.58 2B-4T inference.
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: ^3.5.0
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  bitnet_flutter_ai:
+    path: ../
+
+flutter:
+  uses-material-design: true

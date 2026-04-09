@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="BitNet Flutter AI example — on-device LLM inference.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="BitNet Example">
+  <title>BitNet Flutter AI</title>
+  <link rel="manifest" href="manifest.json">
+
+  <!--
+    Cross-Origin Isolation bootstrap.
+    The COI service worker injects the COOP/COEP headers needed for
+    SharedArrayBuffer, which is required by the BitNet WASM module.
+    This snippet registers it on first load and reloads once.
+  -->
+  <script>
+    if (typeof SharedArrayBuffer === 'undefined') {
+      var reloaded = sessionStorage.getItem('coi-reload');
+      if (!reloaded) {
+        sessionStorage.setItem('coi-reload', '1');
+        navigator.serviceWorker.register('/coi_service_worker.js')
+          .then(function() { location.reload(); });
+      } else {
+        sessionStorage.removeItem('coi-reload');
+      }
+    }
+  </script>
+
+  <!--
+    BitNet WASM glue script.
+    Replace this placeholder path with the actual Emscripten-generated
+    bitnet_bridge.js once you build the WASM artefact.
+    This script exposes window.BitNetWasm used by engine_web.dart.
+  -->
+  <!-- <script src="bitnet_bridge.js"></script> -->
+</head>
+<body>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

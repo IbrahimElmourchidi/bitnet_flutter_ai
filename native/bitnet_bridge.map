@@ -1,0 +1,11 @@
+{
+  global:
+    bn_init;
+    bn_free;
+    bn_free_string;
+    bn_prompt;
+    bn_next_token;
+    bn_context_size;
+    bn_meta;
+  local: *;
+};
