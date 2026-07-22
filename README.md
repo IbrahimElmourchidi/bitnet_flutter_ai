@@ -7,12 +7,12 @@ Run Microsoft's [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.
 
 | Platform | Status |
 |---|---|
-| Android (arm64-v8a) | Planned — native build required |
+| Android (arm64-v8a / x86\_64) | Working — prebuilt `.so` shipped in `jniLibs/` |
+| Linux (x86\_64) | Working — verified end-to-end |
+| Web (desktop Chrome / Firefox) | Working — build with `tool/build_web.sh` (single-threaded, ~1–2 tok/s; desktop only) |
 | iOS (arm64) | Planned — native build required |
 | macOS (arm64 / x86\_64) | Planned — native build required |
-| Linux (x86\_64) | Planned — native build required |
 | Windows (x86\_64) | Planned — native build required |
-| Web (Chrome / Firefox) | Planned — WASM build required |
 
 ---
 
@@ -92,6 +92,43 @@ Future<void> main() async {
   await engine.dispose();
 }
 ```
+
+### Higher-level APIs
+
+`BitNetEngine` is the low-level token streamer. For most apps, prefer the
+higher-level helpers:
+
+```dart
+// Pick a model that fits the device.
+final profile = await DeviceProfile.current();
+final model = BitNetCatalog.compatibleWith(profile.totalRamBytes).first;
+print('Estimated speed: ~${profile.estimateTokensPerSecond(model)} tok/s');
+
+// Load engine + chat session.
+final engine = BitNetEngine(model: model);
+await engine.load();
+final session = BitNetSession(engine: engine, model: model)
+  ..setSystemPrompt('You are a helpful, concise assistant.');
+
+// Stream a chat reply (history is tracked across calls).
+await for (final piece in session.chat('Hello!')) stdout.write(piece);
+
+// One-shot helpers.
+final tldr = await session.summarize(longText, style: 'tldr');
+final answer = await session.assist('What is BitNet?');
+
+// On-device RAG over bundled assets.
+final rag = BitNetRag(
+  session: session,
+  source: AssetKnowledgeSource(assetPaths: ['assets/knowledge/faq.md']),
+);
+await rag.warmUp();
+final result = await rag.ask('How big is the download?');
+print(result.answer);
+for (final c in result.citations) print('  - ${c.chunk.source}');
+```
+
+See the `example/` app for a complete tabbed demo of every public API.
 
 ### Streaming to a Flutter widget
 
@@ -182,21 +219,36 @@ Creates an engine for `model`. Uses a background `Isolate` on native platforms a
 | `Future<void> cancelGeneration()` | Signals the worker to stop at the next token boundary. |
 | `Future<void> dispose()` | Frees all native resources. Do not use the engine after calling this. |
 
-### `BitNetModel`
+### Model catalog
 
-```dart
-static const BitNetModel bitnet2B4T
-```
+`BitNetCatalog.all` lists the curated, SHA-256-pinned models. Pick one with
+`BitNetCatalog.compatibleWith(ramBytes)` (best fit first) or by id, and pass it
+to `BitNetEngine(model: ...)` / `BitNetSession(model: ...)`.
 
-The only supported model in `0.1.0-beta.1`. Immutable const with all metadata:
+| Model | Params | Quant | Backend | Min RAM | License |
+|---|---|---|---|---|---|
+| `microsoft/bitnet-b1.58-2B-4T` | 2.0B | I2_S | bitnet.cpp | 3 GB | MIT |
+| `tiiuae/Falcon3-1B-Instruct-1.58bit` | 1.7B | I2_S | bitnet.cpp | 3 GB | Falcon LLM |
+| `tiiuae/Falcon3-3B-Instruct-1.58bit` | 3.2B | I2_S | bitnet.cpp | 4 GB | Falcon LLM |
+| `tiiuae/Falcon3-7B-Instruct-1.58bit` | 7.5B | I2_S | bitnet.cpp | 5 GB | Falcon LLM |
+| `tiiuae/Falcon3-10B-Instruct-1.58bit` | 10.3B | I2_S | bitnet.cpp | 6 GB | Falcon LLM |
+| `tiiuae/Falcon-E-1B-Instruct` | 1.7B | I2_S | bitnet.cpp | 2 GB | Falcon LLM |
+| `tiiuae/Falcon-E-3B-Instruct` | 3.1B | I2_S | bitnet.cpp | 3 GB | Falcon LLM |
+| `prism-ml/Ternary-Bonsai-1.7B` | 1.7B | Q2_0 | prismQ2† | 2 GB | Apache-2.0 |
+| `prism-ml/Ternary-Bonsai-4B` | 4.0B | Q2_0 | prismQ2† | 3 GB | Apache-2.0 |
+| `prism-ml/Ternary-Bonsai-8B` | 8.2B | Q2_0 | prismQ2† | 5 GB | Apache-2.0 |
 
-| Field | Value |
-|---|---|
-| `id` | `microsoft/bitnet-b1.58-2B-4T` |
-| `ggufFileName` | `ggml-model-i2_s.gguf` |
-| `ggufDownloadUrl` | HuggingFace direct link |
-| `minimumRamBytes` | 3072 MB |
-| `contextLength` | 4096 tokens |
+Each `BitNetModelInfo` carries `id`, `ggufFileName`, `ggufDownloadUrl`,
+`ggufSha256`, `minimumRamBytes`/`recommendedRamBytes`, `contextLength` (capped
+at 4096), a `chatTemplate` (`ChatTemplateFamily`), and an `engineBackend`.
+
+† **PrismML "Ternary Bonsai"** uses an incompatible `qwen3`/`Q2_0` format, so it
+runs on a **second native library** (`libprism_bridge.so`, built from PrismML's
+llama.cpp fork — see [Building Native Libraries](#building-native-libraries)).
+Both backends share the `bn_*` C ABI; the engine picks the right library from
+`model.engineBackend`. The Bonsai models are **native-only** (no WASM build
+yet) and their `.so` is separate from the bitnet.cpp trio — ship it only if you
+use them.
 
 ### `ModelCache`
 
@@ -271,15 +323,30 @@ Add this snippet **before** any other `<script>` tags in `web/index.html`:
 </script>
 ```
 
-### 2. Load the WASM glue script
+### 2. Load the glue script
 
 ```html
-<!-- Emscripten-generated glue file — exposes window.BitNetWasm -->
-<script src="bitnet_bridge.js"></script>
+<!-- Spawns bitnet_worker.js (owns the WASM module, off the UI thread) and
+     defines the async window.BitNetWasm. Only this one tag is needed. -->
+<script src="bitnet_glue.js"></script>
 ```
 
-> The `bitnet_bridge.js` + `bitnet_bridge.wasm` artefacts are not yet published.
-> See [Building Native Libraries](#building-native-libraries) for WASM build instructions.
+`tool/build_web.sh` produces four artefacts and stages them into `example/web/`:
+`bitnet_bridge.js` + `bitnet_bridge.wasm` (Emscripten module), `bitnet_worker.js`
+(the Web Worker that owns the module), and `bitnet_glue.js` (the main-thread
+proxy). Copy all four into your own app's `web/` folder; only `bitnet_glue.js`
+is referenced from `index.html` — the worker loads the bridge itself via
+`importScripts`. `web/bitnet_worker.js` and `web/bitnet_glue.js` ship with the
+package.
+
+> **Web is desktop-browser only.** The model is ~1.1 GB and lives in the WASM
+> heap during inference, so a tab needs multi-GB of memory — fine on desktop
+> Chrome/Firefox, not on mobile browsers. Inference runs in a Web Worker (off
+> the UI thread), single-threaded scalar (**~1–2 tok/s** for the 2B model).
+> Multi-threading (`-pthread` + `SharedArrayBuffer`, which the bundled COI
+> service worker already enables) and a hand-written `wasm_simd128` i2_s kernel
+> are the two speed follow-ups — see the comments in `tool/build_web.sh` and
+> `src/ggml-bitnet-mad.cpp`.
 
 ---
 
@@ -327,14 +394,36 @@ Use Xcode to build a static library (`libbitnet_bridge.a`) and add it as a
 ### Web (WASM)
 
 ```bash
-# Requires Emscripten (emsdk).
-emcmake cmake .. -DCMAKE_BUILD_TYPE=Release
-emmake make
-# Produces: bitnet_bridge.js + bitnet_bridge.wasm
+# Requires Emscripten (emsdk) on PATH.
+source ~/emsdk/emsdk_env.sh
+./tool/build_web.sh
+# Produces (staged into example/web/):
+#   bitnet_bridge.js + bitnet_bridge.wasm   (Emscripten module)
+#   bitnet_glue.js                          (window.BitNetWasm glue, from web/)
 ```
 
-Copy both files into your Flutter app's `web/` folder and reference
-`bitnet_bridge.js` from `index.html` (see [Web Setup](#web-setup)).
+`tool/build_web.sh` applies `native/patches/0001-i2s-portable-kernels.patch`
+(the WASM path uses the portable scalar i2\_s kernels — no AVX2/NEON), builds
+static `libllama.a` + `libggml.a` for wasm32 with `-fexceptions`, then links the
+embind bridge (`native/bitnet_bridge_wasm.cc`) with a 32 MB stack and a 4 GB
+memory ceiling. Copy the three artefacts into your app's `web/` folder and add
+the two `<script>` tags from [Web Setup](#web-setup).
+
+### PrismML (Ternary Bonsai) backend
+
+Only needed if you use a `Ternary-Bonsai-*` model. It builds a **separate**
+self-contained `libprism_bridge.so` from PrismML's llama.cpp fork (a different
+ggml ABI than bitnet.cpp — the two libraries never share symbols).
+
+```bash
+git clone --branch prism https://github.com/PrismML-Eng/llama.cpp.git ../prism-llama.cpp
+./tool/build_linux_prism.sh                                   # Linux desktop / host tests
+ANDROID_NDK=$HOME/Android/Sdk/ndk/<ver> ./tool/build_android_prism.sh   # arm64-v8a + x86_64
+```
+
+Both scripts drive `native/prism/CMakeLists.txt`, which links the fork static
+and version-scripts the output down to just the `bn_*` C ABI. The Android
+script drops `libprism_bridge.so` into `jniLibs/<abi>/`. No web build yet.
 
 ---
 
@@ -365,11 +454,16 @@ DeviceInspector            — platform RAM detection (fail-closed gate)
 
 ## Beta Limitations
 
-- Pre-built native libraries are not distributed. You must build from source.
-- SHA-256 hash for the GGUF file is not yet pinned (`PLACEHOLDER_PIN_AFTER_FIRST_DOWNLOAD`). Hash verification is skipped with a warning until it is pinned in a future release.
-- Web WASM artefact is not published. Web support requires a custom Emscripten build.
-- Windows and Linux desktop are untested in this beta.
-- `cancelGeneration()` on Web cancels only at `yield` boundaries — there is no signal to interrupt a synchronous WASM loop mid-token.
+- Prebuilt libraries ship for Android (`arm64-v8a`, `x86_64`) only. iOS, macOS,
+  and Windows still require building the bridge from source; web is built with
+  `tool/build_web.sh`. Nothing is distributed via pub.dev yet.
+- Web is **desktop-browser only** and **single-threaded scalar** (~1–2 tok/s for
+  the 2B model). The ~1.1 GB model lives in the WASM heap during inference, so a
+  tab needs multi-GB of memory — mobile browsers will OOM. Threading and a
+  `wasm_simd128` kernel are the planned speed follow-ups.
+- `cancelGeneration()` on Web cancels only at `yield` boundaries — there is no
+  signal to interrupt the synchronous WASM decode call mid-token.
+- iOS, macOS, and Windows are untested in this beta.
 - No sampling parameter control yet (temperature, top-p). Greedy sampling is used.
 - The model is not instruction-tuned by default; wrap your prompt in the appropriate chat template for best results.
 

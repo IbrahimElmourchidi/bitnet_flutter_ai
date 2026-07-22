@@ -39,5 +39,7 @@ flutter:
         pluginClass: BitnetFlutterAiPlugin
       ios:
         pluginClass: BitnetFlutterAiPlugin
+      linux:
+        ffiPlugin: true
   assets:
     - web/coi_service_worker.js

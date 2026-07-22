@@ -1,31 +1,46 @@
 import 'dart:async';
 import 'dart:js_interop';
 
-import '../cache/model_cache.dart';
 import '../device/device_inspector.dart';
 import '../exceptions/bitnet_exception.dart';
-import '../model/bitnet_model.dart';
+import '../model/bitnet_model_info.dart';
+import '../session/chat_templates.dart';
 import 'bitnet_engine.dart';
 
 // ---------------------------------------------------------------------------
-// JS interop — expects `window.BitNetWasm` to be set by the consumer's
-// index.html <script> tag loading the Emscripten-generated glue file.
+// JS interop — `window.BitNetWasm` is a proxy (bitnet_glue.js) over a Web
+// Worker that owns the WASM module, so model loading and generation run off
+// the UI thread. Every call is therefore asynchronous (returns a Promise).
+// index.html only needs: <script src="bitnet_glue.js"></script>
 // ---------------------------------------------------------------------------
 
 @JS('BitNetWasm.bn_init')
-external JSAny? _jsInit(JSString modelPath, JSNumber nCtx, JSNumber nThreads);
+external JSPromise<JSAny?> _jsInit(
+    JSString modelPath, JSNumber nCtx, JSNumber nThreads);
 
 @JS('BitNetWasm.bn_prompt')
-external JSNumber _jsPrompt(JSAny ctx, JSString prompt, JSNumber addBos);
+external JSPromise<JSNumber> _jsPrompt(JSAny ctx, JSString prompt, JSNumber addBos);
 
 @JS('BitNetWasm.bn_next_token')
-external JSObject _jsNextToken(JSAny ctx);
+external JSPromise<JSObject> _jsNextToken(JSAny ctx);
 
 @JS('BitNetWasm.bn_free')
-external void _jsFree(JSAny ctx);
+external JSPromise<JSAny?> _jsFree(JSAny ctx);
+
+/// Downloads the GGUF (Cache-API persisted) and streams it into the worker
+/// module's in-memory filesystem at [fsPath]; the worker also frees the file
+/// after `bn_init`. [onProgress] receives a fraction in [0, 1].
+@JS('BitNetWasm.provisionModel')
+external JSPromise<JSAny?> _jsProvisionModel(
+    JSString url, JSString fsPath, JSNumber sizeBytes, JSFunction onProgress);
 
 @JS('BitNetWasm')
 external JSAny? get _bitNetWasm;
+
+/// Resolves once the async Emscripten module finishes instantiating and
+/// `window.BitNetWasm` is defined. May be `null` if the glue script never ran.
+@JS('BitNetWasmReady')
+external JSPromise<JSAny?>? get _bitNetWasmReady;
 
 // ---------------------------------------------------------------------------
 // WebEngine
@@ -33,11 +48,13 @@ external JSAny? get _bitNetWasm;
 
 /// Web WASM implementation of [BitNetEngine].
 ///
-/// Requires `window.BitNetWasm` to be defined before [load] is called.
-/// The COI service worker (`coi_service_worker.js`) must be registered in the
-/// consumer's `index.html` to enable `SharedArrayBuffer` for WASM threads.
+/// Requires `bitnet_glue.js` in the consumer's `index.html`, which spawns a Web
+/// Worker (`bitnet_worker.js`) that owns the WASM module and defines the async
+/// `window.BitNetWasm` proxy. Running in the worker keeps model loading and
+/// token generation off the UI thread. The module is single-threaded, so no
+/// `SharedArrayBuffer` / cross-origin isolation is required.
 class WebEngine implements BitNetEngine {
-  final BitNetModel _model;
+  final BitNetModelInfo _model;
 
   WebEngine(this._model);
 
@@ -51,37 +68,68 @@ class WebEngine implements BitNetEngine {
   Future<void> load({void Function(double progress)? onProgress}) async {
     if (_loaded) return;
 
-    // 1. Check WASM runtime is available.
-    if (_bitNetWasm == null) {
-      throw const BitNetUnsupportedPlatformException(
-        'BitNetWasm is not defined. '
-        'Add the WASM glue <script> to your index.html before loading the engine.',
+    // Web ships only the bitnet.cpp WASM module. The PrismML (Q2_0) backend has
+    // no WASM build yet — fail clearly rather than trying to load a model its
+    // stack can't handle.
+    if (_model.engineBackend != EngineBackend.bitnetCpp) {
+      throw BitNetUnsupportedPlatformException(
+        '${_model.displayName} uses the ${_model.engineBackend.name} backend, '
+        'which is not yet supported on web (native platforms only).',
       );
     }
 
-    // 2. Device check.
-    final ok = await DeviceInspector.instance.meetsMinimumRam();
-    if (!ok) {
-      final ram = await DeviceInspector.instance.totalPhysicalRamBytes();
-      throw BitNetUnsupportedDeviceException(ram);
+    // 1. Wait for the async Emscripten module, then check it is available.
+    if (_bitNetWasm == null && _bitNetWasmReady != null) {
+      await _bitNetWasmReady!.toDart;
+    }
+    if (_bitNetWasm == null) {
+      throw const BitNetUnsupportedPlatformException(
+        'BitNetWasm is not defined. Add the WASM glue <script> tags '
+        '(bitnet_bridge.js then bitnet_glue.js) to your index.html.',
+      );
     }
 
-    // 3. Download / verify model (stored in browser cache via path_provider_web).
-    final path = await ModelCache.ensureModel(
-      _model,
-      onProgress: onProgress ?? (_) {},
-    );
+    // 2. Device check — gate on the selected model's RAM floor (see the native
+    //    engine for rationale). navigator.deviceMemory is coarse on web.
+    final ram = await DeviceInspector.instance.totalPhysicalRamBytes();
+    if (ram < _model.minimumRamBytes) {
+      throw BitNetUnsupportedDeviceException(
+        ram,
+        requiredRamBytes: _model.minimumRamBytes,
+        modelName: _model.displayName,
+      );
+    }
 
-    // 4. Initialise WASM context.
-    final ctx = _jsInit(
-      path.toJS,
+    // 3. Download the GGUF (Cache-API persisted) and stream it into the
+    //    module's in-memory filesystem. dart:io / path_provider don't exist on
+    //    web, so the JS glue owns the download + FS write; we just await it.
+    final fsPath = '/models/${_model.ggufFileName}';
+    final progressShim = ((JSNumber fraction) {
+      if (onProgress != null) onProgress(fraction.toDartDouble);
+    }).toJS;
+    try {
+      await _jsProvisionModel(
+        _model.ggufDownloadUrl.toJS,
+        fsPath.toJS,
+        _model.ggufSizeBytes.toJS,
+        progressShim,
+      ).toDart;
+    } catch (e) {
+      throw BitNetDownloadException('WASM model provisioning failed: $e');
+    }
+
+    // 4. Initialise the WASM context from the in-memory GGUF (runs in the
+    //    worker; it frees the FS copy afterwards). Single-threaded (nThreads=1):
+    //    the shipped module is built without pthreads.
+    final ctx = await _jsInit(
+      fsPath.toJS,
       _model.contextLength.toJS,
-      0.toJS, // nThreads: 0 → hardware_concurrency inside WASM
-    );
+      1.toJS,
+    ).toDart;
 
     if (ctx == null) {
       throw const BitNetInitException(
-        message: 'bn_init returned null from WASM module.',
+        message: 'bn_init returned null from WASM module (model load failed).',
       );
     }
 
@@ -97,14 +145,19 @@ class WebEngine implements BitNetEngine {
   }) async* {
     if (!_loaded || _ctx == null) throw const BitNetNotLoadedException();
 
-    final rc = _jsPrompt(_ctx!, prompt.toJS, (addBos ? 1 : 0).toJS).toDartInt;
+    final rc = (await _jsPrompt(_ctx!, prompt.toJS, (addBos ? 1 : 0).toJS).toDart)
+        .toDartInt;
     if (rc != 0) {
       throw const BitNetInferenceException(message: 'bn_prompt failed in WASM.');
     }
 
     var count = 0;
+    // Detects this model's end-of-turn markers even when split across several
+    // token pieces. Markers are template-specific (see chat_templates.dart).
+    final stopDetector =
+        TurnStopDetector(chatTemplateFor(_model.chatTemplate).stopMarkers);
     while (maxNewTokens == 0 || count < maxNewTokens) {
-      final result = _jsNextToken(_ctx!);
+      final result = await _jsNextToken(_ctx!).toDart;
       final dartResult = result.dartify() as Map<Object?, Object?>?;
       if (dartResult == null) {
         throw const BitNetInferenceException(
@@ -117,23 +170,37 @@ class WebEngine implements BitNetEngine {
 
       final token = dartResult['token'] as String?;
       if (token != null) {
-        yield token;
+        final emit = stopDetector.feed(token);
+        if (emit.isNotEmpty) yield emit;
+        if (stopDetector.stopped) {
+          // A complete end-of-turn marker was assembled — stop without
+          // yielding the marker text itself.
+          break;
+        }
         count++;
       }
+    }
+
+    // Release any text held back pending marker detection (stream ended via
+    // EOS or token cap).
+    if (!stopDetector.stopped) {
+      final rest = stopDetector.flush();
+      if (rest.isNotEmpty) yield rest;
     }
   }
 
   @override
   Future<void> cancelGeneration() async {
-    // WASM runs on the main thread synchronously; cancellation only takes
-    // effect between yield points (token boundaries) in the async* generator.
-    // No explicit signal needed — the caller can cancel the StreamSubscription.
+    // Generation runs one token per worker round-trip; cancellation takes
+    // effect at the next token boundary when the caller stops pulling the
+    // stream (the async* loop simply stops requesting more tokens). No
+    // explicit interrupt is sent — the worker finishes the current token.
   }
 
   @override
   Future<void> dispose() async {
     if (_ctx != null) {
-      _jsFree(_ctx!);
+      await _jsFree(_ctx!).toDart;
       _ctx = null;
     }
     _loaded = false;
@@ -141,4 +208,4 @@ class WebEngine implements BitNetEngine {
 }
 
 /// Factory function resolved by the conditional import in [bitnet_engine.dart].
-BitNetEngine createEngine({required BitNetModel model}) => WebEngine(model);
+BitNetEngine createEngine({required BitNetModelInfo model}) => WebEngine(model);

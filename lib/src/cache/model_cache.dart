@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../exceptions/bitnet_exception.dart';
-import '../model/bitnet_model.dart';
+import '../model/bitnet_model_info.dart';
 
 /// Downloads, verifies, and caches the GGUF model file on disk.
 ///
@@ -30,7 +30,7 @@ abstract final class ModelCache {
   ///
   /// Returns the absolute path to the verified model file.
   static Future<String> ensureModel(
-    BitNetModel model, {
+    BitNetModelInfo model, {
     required void Function(double progress) onProgress,
     http.Client? client,
   }) async {
@@ -77,13 +77,13 @@ abstract final class ModelCache {
 
   /// Returns the absolute path where [model] would be stored, whether or not
   /// the file currently exists.
-  static Future<String> modelPath(BitNetModel model) async {
+  static Future<String> modelPath(BitNetModelInfo model) async {
     final dir = await _cacheDir();
     return p.join(dir.path, model.ggufFileName);
   }
 
   /// Deletes the model file and any in-progress `.part` file.
-  static Future<void> clearModel(BitNetModel model) async {
+  static Future<void> clearModel(BitNetModelInfo model) async {
     final dir = await _cacheDir();
     final modelFile = File(p.join(dir.path, model.ggufFileName));
     final tempFile = File(p.join(dir.path, '${model.ggufFileName}.part'));
@@ -96,7 +96,7 @@ abstract final class ModelCache {
   // ---------------------------------------------------------------------------
 
   static Future<void> _download({
-    required BitNetModel model,
+    required BitNetModelInfo model,
     required File tempFile,
     required File modelFile,
     required void Function(double) onProgress,

@@ -13,5 +13,10 @@ dependencies:
   bitnet_flutter_ai:
     path: ../
 
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
 flutter:
   uses-material-design: true
+  assets:
+    - assets/knowledge/bitnet_faq.md

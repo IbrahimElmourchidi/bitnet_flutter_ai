@@ -63,6 +63,43 @@ This installs the model download helper and quantisation scripts.
 
 ---
 
+## Step 3 — Apply the portable-kernels patch (ALL platforms)
+
+> **Required on every platform, including Linux desktop.** Skipping this
+> produces a library that appears to load fine but emits a runaway stream of
+> `!` at inference time.
+
+The pristine bitnet.cpp I2\_S matmul kernels
+(`src/ggml-bitnet-mad.cpp`) are implemented **only** for AVX2 and ARM NEON,
+with no fallback:
+
+- On a target compiled without AVX2 (notably the **Android x86_64 emulator** —
+  the NDK x86_64 baseline has no AVX2), the kernels compile to *empty
+  functions*. Every matmul then writes nothing, the logits come out flat, and
+  greedy sampling returns token 0 (`"!"`) forever.
+- The NEON path additionally used a wrong on-disk weight layout, so arm64
+  results were incorrect even though the kernels were non-empty.
+
+Apply the bundled patch to the bitnet.cpp checkout. It adds a portable scalar
+fallback (bit-exact with the AVX2 kernel) and a corrected canonical-layout NEON
+path, and fixes an arm64 `PARALLEL_SIZE` mis-dispatch:
+
+```bash
+# From the bitnet.cpp checkout, with bitnet_flutter_ai/ as a sibling:
+git apply ../bitnet_flutter_ai/native/patches/0001-i2s-portable-kernels.patch
+```
+
+`tool/build_android.sh` applies this patch automatically (idempotently), so
+you only need to run the command above for manual desktop/iOS builds.
+
+> **Optional — faster x86_64 emulator.** On a host CPU that supports AVX2 you
+> can build the Android x86_64 library with the AVX2 code paths for a large
+> speedup: `BITNET_ANDROID_X86_AVX2=1 ./tool/build_android.sh`. Leave it off
+> (the default) if the emulator might run on a non-AVX2 host, or the binary
+> will `SIGILL`. The scalar kernels are always correct regardless.
+
+---
+
 ## Platform builds
 
 ---
@@ -176,44 +213,132 @@ cp bitnet.cpp/build-macos/libllama.dylib   bitnet_flutter_ai/macos/
 
 ## Desktop — Linux
 
+> **Verified pipeline.** The steps below were exercised end-to-end on Ubuntu
+> (x86_64, GCC 14, CMake 3.31, Ninja 1.12) and produced ~12 tok/s on a
+> Ryzen 7 5700U for the 2B-4T I2_S model.
+
 ### Tools needed
 
 ```bash
-sudo apt-get install -y build-essential cmake ninja-build git
+sudo apt-get install -y build-essential cmake ninja-build git python3 python3-pip
+pip install --user numpy
 ```
 
-### 3a. Build libllama (Linux)
+> **Compiler choice — important.** The bitnet kernels in
+> `src/ggml-bitnet-mad.cpp` rely on `-fpermissive`, which the project's
+> `CMakeLists.txt` only enables for **GCC**. Building with Clang fails with
+> a const-correctness error. Always pass `-DCMAKE_C_COMPILER=gcc
+> -DCMAKE_CXX_COMPILER=g++` on Linux.
+
+### 3a. Generate the BitNet kernel header (codegen)
+
+bitnet.cpp's CMake build expects `include/bitnet-lut-kernels.h` to exist. For
+the 2B-4T model on x86_64 it reuses the 3B kernel parameters:
+
+```bash
+cd bitnet.cpp
+mkdir -p include
+python3 utils/codegen_tl2.py --model bitnet_b1_58-3B \
+    --BM 160,320,320 --BK 96,96,96 --bm 32,32,32
+```
+
+### 3b. Build libllama (Linux)
 
 ```bash
 cd bitnet.cpp
 cmake -B build-linux -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DLLAMA_NATIVE=OFF \
+      -DBITNET_X86_TL2=OFF \
+      -DCMAKE_C_COMPILER=gcc \
+      -DCMAKE_CXX_COMPILER=g++ \
       -DLLAMA_BUILD_TESTS=OFF \
-      -DLLAMA_BUILD_EXAMPLES=OFF
-ninja -C build-linux llama
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=OFF \
+      -DLLAMA_NATIVE=OFF
+cmake --build build-linux --target llama -- -j$(nproc)
 ```
 
-Output: `bitnet.cpp/build-linux/libllama.so`
+Outputs (note the nested paths — bitnet.cpp does not create a flat
+`build-linux/lib/`):
 
-### 3b. Build libbitnet_bridge.so (Linux)
+```
+bitnet.cpp/build-linux/3rdparty/llama.cpp/src/libllama.so
+bitnet.cpp/build-linux/3rdparty/llama.cpp/ggml/src/libggml.so
+```
+
+### 3c. Stage the headers + libs into the layout the bridge expects
+
+The plugin's [native/CMakeLists.txt](native/CMakeLists.txt) takes a single
+`LLAMA_INSTALL_PREFIX` and looks for `include/llama.h` and `lib/libllama.so`
+under it. Because bitnet.cpp does not actually run `cmake --install`, we
+stage the artefacts via symlinks:
+
+```bash
+cd bitnet.cpp
+mkdir -p stage/lib stage/include
+ln -sf $PWD/build-linux/3rdparty/llama.cpp/src/libllama.so       stage/lib/libllama.so
+ln -sf $PWD/build-linux/3rdparty/llama.cpp/ggml/src/libggml.so   stage/lib/libggml.so
+ln -sf $PWD/3rdparty/llama.cpp/include/llama.h                   stage/include/llama.h
+for h in $PWD/3rdparty/llama.cpp/ggml/include/*.h; do
+    ln -sf "$h" stage/include/$(basename "$h")
+done
+```
+
+### 3d. Build libbitnet_bridge.so
 
 ```bash
 cd bitnet_flutter_ai/native
 cmake -B build-linux -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DLLAMA_INSTALL_PREFIX=../../bitnet.cpp/build-linux
+      -DLLAMA_INSTALL_PREFIX=$PWD/../../bitnet.cpp/stage
 ninja -C build-linux
 ```
 
 Output: `native/build-linux/libbitnet_bridge.so`
 
-### 3c. Copy outputs
+### 3e. Smoke-test the bridge end-to-end
+
+Download the GGUF (1,187,801,280 bytes, SHA-256
+`4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162`):
+
+```bash
+mkdir -p ../bitnet.cpp/models/BitNet-b1.58-2B-4T
+curl -L -C - -o ../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+    https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf
+```
+
+C smoke test (`native/smoke_test.c`):
+
+```bash
+cd bitnet_flutter_ai/native
+gcc smoke_test.c -o build-linux/smoke_test \
+    -I. -L./build-linux -l:libbitnet_bridge.so \
+    -Wl,-rpath,$PWD/build-linux \
+    -Wl,-rpath,$PWD/../../bitnet.cpp/build-linux/3rdparty/llama.cpp/src \
+    -Wl,-rpath,$PWD/../../bitnet.cpp/build-linux/3rdparty/llama.cpp/ggml/src
+./build-linux/smoke_test \
+    ../../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+    "Hello, who are you?"
+```
+
+Dart-only smoke test (exercises the actual FFI surface used by
+`BitNetEngine`):
+
+```bash
+cd bitnet_flutter_ai
+LD_LIBRARY_PATH="$PWD/native/build-linux:$PWD/../bitnet.cpp/build-linux/3rdparty/llama.cpp/src:$PWD/../bitnet.cpp/build-linux/3rdparty/llama.cpp/ggml/src" \
+    dart run tool/dart_smoke.dart \
+    ../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+    "Explain ternary quantization in one sentence." 40
+```
+
+### 3f. Copy outputs into the package's `linux/` desktop folder
 
 ```bash
 mkdir -p bitnet_flutter_ai/linux
-cp native/build-linux/libbitnet_bridge.so  bitnet_flutter_ai/linux/
-cp bitnet.cpp/build-linux/libllama.so      bitnet_flutter_ai/linux/
+cp native/build-linux/libbitnet_bridge.so       bitnet_flutter_ai/linux/
+cp -L bitnet.cpp/stage/lib/libllama.so           bitnet_flutter_ai/linux/
+cp -L bitnet.cpp/stage/lib/libggml.so            bitnet_flutter_ai/linux/
 ```
 
 ---
@@ -349,6 +474,46 @@ Then update [ios/bitnet_flutter_ai.podspec](ios/bitnet_flutter_ai.podspec):
 ```ruby
 s.vendored_libraries = 'Frameworks/libbitnet_bridge.a', 'Frameworks/libllama.a'
 ```
+
+---
+
+## Optional — PrismML (Ternary Bonsai) backend
+
+The `Ternary-Bonsai-*` catalog models use PrismML's `qwen3`/`Q2_0` GGUF format,
+which is **incompatible** with the bitnet.cpp libraries built above (different
+ggml ABI). They run on a second, self-contained `libprism_bridge.so` built from
+PrismML's llama.cpp fork. Skip this entirely if you don't ship Bonsai models.
+
+```bash
+# 1. Clone the fork as a sibling of bitnet_flutter_ai/ (pin a known-good commit
+#    in production — the fork tracks upstream llama.cpp).
+git clone --branch prism https://github.com/PrismML-Eng/llama.cpp.git ../prism-llama.cpp
+
+# 2a. Linux desktop / host smoke tests:
+./tool/build_linux_prism.sh
+#     → native/build-linux-prism/libprism_bridge.so  (also copied to linux/)
+
+# 2b. Android (arm64-v8a + x86_64):
+ANDROID_NDK=$HOME/Android/Sdk/ndk/<ver> ./tool/build_android_prism.sh
+#     → android/src/main/jniLibs/<abi>/libprism_bridge.so
+```
+
+Both scripts use `native/prism/CMakeLists.txt`, which links the fork **static**
+into one shared library and applies `native/prism/prism_exports.map` (a GNU-ld
+version script) so the `.so` exports **only** the `bn_*` C ABI — its modern
+ggml symbols stay hidden and cannot interpose on the bitnet.cpp `libggml.so`
+loaded in the same process. Dart selects the library from
+`BitNetModelInfo.engineBackend` and dlopen's it `RTLD_LOCAL`.
+
+Smoke-test the bridge directly (host):
+
+```bash
+gcc -I native native/prism_smoke.c -L native/build-linux-prism -lprism_bridge -o /tmp/prism_smoke
+LD_LIBRARY_PATH=native/build-linux-prism /tmp/prism_smoke <bonsai>.gguf
+# expect: bn_init OK … coherent generated text … PASS
+```
+
+There is no web (WASM) build of the prism backend yet.
 
 ---
 

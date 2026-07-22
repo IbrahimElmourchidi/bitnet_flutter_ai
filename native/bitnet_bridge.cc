@@ -18,11 +18,32 @@
 #include "bitnet_bridge.h"
 #include "llama.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+// llama.cpp model-load progress (0..1), forwarded to the Web Worker's main
+// thread as a postMessage so the UI can show "loading model" progress. Without
+// this, bn_init is a long opaque blocking call and the page looks frozen after
+// the download hits 100%.
+static bool bn_wasm_load_progress(float progress, void* /*user_data*/) {
+    // Guard postMessage: it exists in a Web Worker but not in a plain Node
+    // context (used by the headless tests), where calling it would throw.
+    EM_ASM({
+        if (typeof postMessage === 'function') {
+            postMessage({ type: 'load_progress', frac: $0 });
+        }
+    }, (double)progress);
+    return true; // continue loading
+}
+#endif
 
 /* ------------------------------------------------------------------
  * Internal context struct
@@ -34,6 +55,10 @@ struct BnContext {
     llama_sampler* sampler  = nullptr;
     int            n_past   = 0;    // tokens already in the KV cache
     int            n_ctx    = 0;    // context window size
+    // Scratch buffer for bn_meta() lookups. The pointer returned by
+    // bn_meta points into this buffer and is only valid until the next
+    // bn_meta() call on the same context.
+    char           meta_buf[1024] = {};
 };
 
 /* ------------------------------------------------------------------
@@ -73,8 +98,13 @@ BnContext* bn_init(
     // Load model from GGUF
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;  // CPU-only; BitNet I2_S kernels are CPU-optimised
+#ifdef __EMSCRIPTEN__
+    // Report tensor-load progress to the UI (web only).
+    mparams.progress_callback = bn_wasm_load_progress;
+    mparams.progress_callback_user_data = nullptr;
+#endif
 
-    llama_model* model = llama_model_load_from_file(model_path, mparams);
+    llama_model* model = llama_load_model_from_file(model_path, mparams);
     if (!model) {
         set_err(out_err, std::string("Failed to load model from: ") + model_path);
         return nullptr;
@@ -83,17 +113,24 @@ BnContext* bn_init(
     // Resolve context window size
     const int ctx_size = (n_ctx > 0)
         ? static_cast<int>(n_ctx)
-        : llama_model_n_ctx_train(model);
+        : llama_n_ctx_train(model);
 
     // Create inference context
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx      = static_cast<uint32_t>(ctx_size);
     cparams.n_threads  = static_cast<uint32_t>(threads);
     cparams.n_threads_batch = static_cast<uint32_t>(threads);
+    // Cap the micro-batch. The BitNet I2_S gemm path allocates a stack VLA
+    // sized by (rows * n_ubatch) during prefill; with the default 512 and a
+    // 6912-wide FFN this can exceed a mobile thread's ~1 MB stack and crash on
+    // long prompts. 128 keeps it comfortably bounded with negligible speed cost.
+    if (cparams.n_ubatch > 128) {
+        cparams.n_ubatch = 128;
+    }
 
     llama_context* lctx = llama_new_context_with_model(model, cparams);
     if (!lctx) {
-        llama_model_free(model);
+        llama_free_model(model);
         set_err(out_err, "Failed to create llama context");
         return nullptr;
     }
@@ -116,7 +153,7 @@ void bn_free(BnContext* ctx) {
     if (!ctx) return;
     if (ctx->sampler) llama_sampler_free(ctx->sampler);
     if (ctx->ctx)     llama_free(ctx->ctx);
-    if (ctx->model)   llama_model_free(ctx->model);
+    if (ctx->model)   llama_free_model(ctx->model);
     delete ctx;
 }
 
@@ -143,14 +180,22 @@ int32_t bn_prompt(
     const int max_tokens = ctx->n_ctx;
     std::vector<llama_token> tokens(max_tokens);
 
+    // If the caller already prefixed an explicit BOS token (e.g. the
+    // Llama-3 chat template starts with "<|begin_of_text|>"), don't add a
+    // second one — that double-BOS confuses the model.
+    const std::string p(prompt);
+    const bool has_explicit_bos =
+        p.compare(0, 17, "<|begin_of_text|>") == 0;
+    const bool effective_add_bos = (add_bos != 0) && !has_explicit_bos;
+
     const int n_tokens = llama_tokenize(
         ctx->model,
         prompt,
-        static_cast<int32_t>(std::strlen(prompt)),
+        static_cast<int32_t>(p.size()),
         tokens.data(),
         max_tokens,
-        add_bos != 0,   // add BOS
-        false            // special tokens
+        effective_add_bos,
+        true   // parse_special: render <|...|> markers as their special token IDs
     );
 
     if (n_tokens < 0) {
@@ -160,15 +205,52 @@ int32_t bn_prompt(
 
     tokens.resize(static_cast<size_t>(n_tokens));
 
+    std::fprintf(stderr,
+        "[bitnet_bridge] bn_prompt: chars=%zu tokens=%d add_bos=%d "
+        "parse_special=1 first_ids=[%d,%d,%d]\n",
+        p.size(), n_tokens, effective_add_bos ? 1 : 0,
+        n_tokens > 0 ? tokens[0] : -1,
+        n_tokens > 1 ? tokens[1] : -1,
+        n_tokens > 2 ? tokens[2] : -1);
+
     // Reset KV cache position for a fresh conversation turn
     llama_kv_cache_clear(ctx->ctx);
     ctx->n_past = 0;
 
     // Prefill: batch all prompt tokens in one decode call
-    llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
+    // bitnet.cpp's llama.cpp pin uses the older 4-arg llama_batch_get_one signature.
+    llama_batch batch = llama_batch_get_one(
+        tokens.data(),
+        static_cast<int32_t>(tokens.size()),
+        /*pos_0=*/0,
+        /*seq_id=*/0
+    );
     if (llama_decode(ctx->ctx, batch) != 0) {
         set_err(out_err, "llama_decode failed during prompt prefill");
         return -1;
+    }
+
+    // Guard against a libggml that was built without functional I2_S kernels
+    // for this CPU/ABI (e.g. Android x86_64 compiled with no AVX2 and no
+    // scalar fallback). In that case every matmul writes nothing, the logits
+    // come out flat/non-finite, and greedy sampling would emit a runaway
+    // stream of a single token ("!"). Detect it here and fail loudly instead.
+    const float* logits = llama_get_logits_ith(ctx->ctx, -1);
+    if (logits) {
+        const int n_vocab = llama_n_vocab(ctx->model);
+        bool flat = true;
+        bool finite = true;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (!std::isfinite(logits[i])) { finite = false; break; }
+            if (logits[i] != logits[0]) { flat = false; }
+        }
+        if (!finite || flat) {
+            set_err(out_err,
+                "BitNet produced degenerate logits (flat or non-finite) after "
+                "prompt prefill. The linked libggml was likely built without "
+                "functional I2_S kernels for this CPU/ABI.");
+            return -1;
+        }
     }
 
     ctx->n_past = static_cast<int>(tokens.size());
@@ -225,7 +307,12 @@ char* bn_next_token(
     piece_buf[piece_len] = '\0';
 
     // Feed the sampled token back for the next step
-    llama_batch batch = llama_batch_get_one(&token_id, 1);
+    llama_batch batch = llama_batch_get_one(
+        const_cast<llama_token*>(&token_id),
+        1,
+        /*pos_0=*/ctx->n_past,
+        /*seq_id=*/0
+    );
     if (llama_decode(ctx->ctx, batch) != 0) {
         set_err(out_err, "llama_decode failed during generation step");
         return nullptr;
@@ -253,5 +340,13 @@ int32_t bn_context_size(const BnContext* ctx) {
 
 const char* bn_meta(const BnContext* ctx, const char* key) {
     if (!ctx || !key) return nullptr;
-    return llama_model_meta_val_str(ctx->model, key);
+    // bitnet.cpp's pinned llama.cpp returns the value into a caller-owned
+    // buffer and returns its length. We stash it in the context's scratch
+    // buffer; the pointer is valid until the next bn_meta() call.
+    BnContext* mut = const_cast<BnContext*>(ctx);
+    const int32_t n = llama_model_meta_val_str(
+        ctx->model, key, mut->meta_buf, sizeof(mut->meta_buf)
+    );
+    if (n < 0) return nullptr;
+    return mut->meta_buf;
 }

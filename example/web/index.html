@@ -31,12 +31,14 @@
   </script>
 
   <!--
-    BitNet WASM glue script.
-    Replace this placeholder path with the actual Emscripten-generated
-    bitnet_bridge.js once you build the WASM artefact.
-    This script exposes window.BitNetWasm used by engine_web.dart.
+    BitNet WASM glue. bitnet_glue.js spawns a Web Worker (bitnet_worker.js)
+    that owns the Emscripten module (bitnet_bridge.js + bitnet_bridge.wasm) so
+    model loading and generation run OFF the UI thread, and exposes the async
+    window.BitNetWasm used by engine_web.dart. Only this one script is loaded on
+    the main thread; the worker importScripts the bridge itself. All four files
+    are staged here by `tool/build_web.sh`.
   -->
-  <!-- <script src="bitnet_bridge.js"></script> -->
+  <script src="bitnet_glue.js"></script>
 </head>
 <body>
   <script src="flutter_bootstrap.js" async></script>

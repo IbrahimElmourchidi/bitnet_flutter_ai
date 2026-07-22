@@ -14,9 +14,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   lib/libllama.dylib (macOS)
 #   lib/llama.lib + bin/llama.dll (Windows)
 # ---------------------------------------------------------------------------
-set(LLAMA_INSTALL_PREFIX "" CACHE PATH
+set(LLAMA_INSTALL_PREFIX "$ENV{BITNET_LLAMA_PREFIX}" CACHE PATH
     "Root of the bitnet.cpp build output (must contain include/ and lib/).")
 
+if(NOT LLAMA_INSTALL_PREFIX AND NOT "$ENV{BITNET_LLAMA_PREFIX}" STREQUAL "")
+    set(LLAMA_INSTALL_PREFIX "$ENV{BITNET_LLAMA_PREFIX}")
+endif()
 if(NOT LLAMA_INSTALL_PREFIX)
     message(FATAL_ERROR
         "LLAMA_INSTALL_PREFIX is not set.\n"
@@ -80,11 +83,32 @@ if(NOT WIN32)
     )
 endif()
 
-# Platform-specific output naming
+# Platform-specific output naming.
+# - On Linux/macOS the default "lib" prefix is correct (Dart's
+#   DynamicLibrary.open('libbitnet_bridge.so') expects it).
+# - On Windows the prefix must be empty so the DLL is named
+#   `bitnet_bridge.dll` and not `libbitnet_bridge.dll`.
 set_target_properties(bitnet_bridge PROPERTIES
     OUTPUT_NAME "bitnet_bridge"
-    PREFIX      ""            # suppress "lib" prefix on Windows
 )
+if(WIN32)
+    set_target_properties(bitnet_bridge PROPERTIES PREFIX "")
+endif()
+
+# When bundled into a Flutter desktop app, libbitnet_bridge.so sits in the
+# same lib/ directory as libllama.so / libggml.so. Use $ORIGIN so the dynamic
+# loader resolves the transitive dependencies regardless of the install path.
+if(UNIX AND NOT APPLE)
+    set_target_properties(bitnet_bridge PROPERTIES
+        BUILD_RPATH   "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+    )
+elseif(APPLE)
+    set_target_properties(bitnet_bridge PROPERTIES
+        BUILD_RPATH   "@loader_path"
+        INSTALL_RPATH "@loader_path"
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # iOS: build as a static library instead of shared

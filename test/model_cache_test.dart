@@ -1,12 +1,30 @@
 import 'dart:io';
 
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+
+/// Builds a [BitNetModelInfo] whose pinned SHA-256 matches [bytes].
+/// Allows the cache tests to use small synthetic fixtures while still
+/// exercising the real hash verification path.
+BitNetModelInfo _modelForBytes(List<int> bytes, {String? sha}) {
+  final digest = sha ?? sha256.convert(bytes).toString();
+  return BitNetModelInfo.forTest(
+    id: 'test/fake-model',
+    displayName: 'Fake Test Model',
+    ggufFileName: 'ggml-model-i2_s.gguf',
+    ggufSizeBytes: bytes.length,
+    ggufSha256: digest,
+    ggufDownloadUrl: 'https://example.test/fake.gguf',
+    minimumRamBytes: 0,
+    contextLength: 128,
+  );
+}
 
 void main() {
   late Directory tempDir;
@@ -21,9 +39,20 @@ void main() {
   });
 
   test('ensureModel skips hash check when SHA is placeholder', () async {
+    final placeholderModel = BitNetModelInfo.forTest(
+      id: 'test/fake-model',
+      displayName: 'Fake Test Model',
+      ggufFileName: 'ggml-model-i2_s.gguf',
+      ggufSizeBytes: 3,
+      ggufSha256: 'PLACEHOLDER_PIN_AFTER_FIRST_DOWNLOAD',
+      ggufDownloadUrl: 'https://example.test/fake.gguf',
+      minimumRamBytes: 0,
+      contextLength: 128,
+    );
+
     // Arrange: pre-create a fake model file.
     final modelFile = File(
-      p.join(tempDir.path, 'bitnet_flutter_ai', BitNetModel.bitnet2B4T.ggufFileName),
+      p.join(tempDir.path, 'bitnet_flutter_ai', placeholderModel.ggufFileName),
     );
     await modelFile.parent.create(recursive: true);
     await modelFile.writeAsBytes([1, 2, 3]);
@@ -31,7 +60,7 @@ void main() {
     // Act: should return immediately without downloading.
     final client = MockClient((_) async => throw Exception('should not call'));
     final path = await ModelCache.ensureModel(
-      BitNetModel.bitnet2B4T,
+      placeholderModel,
       onProgress: (_) {},
       client: client,
     );
@@ -41,6 +70,8 @@ void main() {
 
   test('ensureModel downloads file when absent', () async {
     final fakeBytes = List<int>.generate(100, (i) => i);
+    final model = _modelForBytes(fakeBytes);
+
     final client = MockClient((request) async {
       return http.Response.bytes(
         fakeBytes,
@@ -51,7 +82,7 @@ void main() {
 
     double? lastProgress;
     final path = await ModelCache.ensureModel(
-      BitNetModel.bitnet2B4T,
+      model,
       onProgress: (p) => lastProgress = p,
       client: client,
     );
@@ -62,27 +93,30 @@ void main() {
   });
 
   test('ensureModel sends Range header when .part file exists', () async {
-    // Pre-create a partial file.
+    final fullBytes = [0, 1, 2, 3, 4, 5];
+    final model = _modelForBytes(fullBytes);
+
+    // Pre-create a partial file with the first 3 bytes.
     final partFile = File(p.join(
       tempDir.path,
       'bitnet_flutter_ai',
-      '${BitNetModel.bitnet2B4T.ggufFileName}.part',
+      '${model.ggufFileName}.part',
     ));
     await partFile.parent.create(recursive: true);
-    await partFile.writeAsBytes([0, 1, 2]); // 3 bytes already downloaded
+    await partFile.writeAsBytes(fullBytes.sublist(0, 3));
 
     String? rangeHeader;
     final client = MockClient((request) async {
       rangeHeader = request.headers['range'];
       return http.Response.bytes(
-        [3, 4, 5], // remaining bytes
+        fullBytes.sublist(3), // remaining bytes
         206,
         headers: {'content-length': '3'},
       );
     });
 
     await ModelCache.ensureModel(
-      BitNetModel.bitnet2B4T,
+      model,
       onProgress: (_) {},
       client: client,
     );
@@ -94,12 +128,12 @@ void main() {
     final dir = Directory(p.join(tempDir.path, 'bitnet_flutter_ai'));
     await dir.create(recursive: true);
 
-    final modelFile = File(p.join(dir.path, BitNetModel.bitnet2B4T.ggufFileName));
-    final partFile = File(p.join(dir.path, '${BitNetModel.bitnet2B4T.ggufFileName}.part'));
+    final modelFile = File(p.join(dir.path, BitNetCatalog.bitnet2B4T.ggufFileName));
+    final partFile = File(p.join(dir.path, '${BitNetCatalog.bitnet2B4T.ggufFileName}.part'));
     await modelFile.writeAsBytes([1]);
     await partFile.writeAsBytes([1]);
 
-    await ModelCache.clearModel(BitNetModel.bitnet2B4T);
+    await ModelCache.clearModel(BitNetCatalog.bitnet2B4T);
 
     expect(modelFile.existsSync(), isFalse);
     expect(partFile.existsSync(), isFalse);

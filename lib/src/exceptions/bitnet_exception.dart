@@ -7,14 +7,21 @@ sealed class BitNetException implements Exception {
   String toString() => 'BitNetException($runtimeType): $message';
 }
 
-/// Device physical RAM is below the 3072 MB minimum required by BitNet 2B-4T.
+/// Device physical RAM is below the minimum required by the selected model.
 final class BitNetUnsupportedDeviceException extends BitNetException {
   final int availableRamBytes;
 
-  const BitNetUnsupportedDeviceException(this.availableRamBytes)
-      : super(
-          'Device RAM (${availableRamBytes ~/ (1024 * 1024)} MB) is below '
-          'the 3072 MB minimum required by BitNet 2B-4T.',
+  /// Minimum RAM the model requires, in bytes. `0` when unknown (legacy call).
+  final int requiredRamBytes;
+
+  const BitNetUnsupportedDeviceException(
+    this.availableRamBytes, {
+    this.requiredRamBytes = 0,
+    String? modelName,
+  }) : super(
+          'Device RAM (${availableRamBytes ~/ (1024 * 1024)} MB) is below the '
+          '${requiredRamBytes ~/ (1024 * 1024)} MB minimum required'
+          '${modelName != null ? ' by $modelName' : ''}.',
         );
 }
 

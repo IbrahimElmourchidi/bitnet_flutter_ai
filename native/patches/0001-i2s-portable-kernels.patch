@@ -1,0 +1,804 @@
+diff --git a/include/gemm-config.h b/include/gemm-config.h
+index 6a88c42..0e44643 100644
+--- a/include/gemm-config.h
++++ b/include/gemm-config.h
+@@ -14,7 +14,12 @@
+ #if defined(ACT_PARALLEL)
+     #define ROW_BLOCK_SIZE 8
+     #define COL_BLOCK_SIZE 256
+-    #define PARALLEL_SIZE 8
++    // PARALLEL_SIZE must divide every gemm row-block count. The gemm path
++    // (ggml-aarch64.c) processes ROW_BLOCK_SIZE(=8) rows per outer step but
++    // the final tail block can be 4 (ne11 rounded down to a multiple of 4),
++    // so PARALLEL_SIZE=8 would mis-route that tail to the _1x1 kernel, whose
++    // argument semantics differ from _Nx1 -> garbage. 4 divides both 8 and 4.
++    #define PARALLEL_SIZE 4
+ #else
+     #define ROW_BLOCK_SIZE 64
+     #define COL_BLOCK_SIZE 16
+@@ -31,5 +36,18 @@
+     #define PARALLEL_SIZE 4
+ #endif // ACT_PARALLEL
+ #endif // __ARM_FEATURE_DOTPROD
++#else
++// No SIMD ISA detected (e.g. a generic host build with GGML_NATIVE=OFF, or an
++// Android x86_64 target compiled without -mavx2). The portable scalar i2_s
++// kernels in ggml-bitnet-mad.cpp use these too, so they must always be defined.
++#if defined(ACT_PARALLEL)
++    #define ROW_BLOCK_SIZE 4
++    #define COL_BLOCK_SIZE 128
++    #define PARALLEL_SIZE 4
++#else
++    #define ROW_BLOCK_SIZE 128
++    #define COL_BLOCK_SIZE 32
++    #define PARALLEL_SIZE 4
++#endif // ACT_PARALLEL
+ #endif // __AVX__
+ 
+diff --git a/src/ggml-bitnet-mad.cpp b/src/ggml-bitnet-mad.cpp
+index 4ba9d65..cd2d834 100644
+--- a/src/ggml-bitnet-mad.cpp
++++ b/src/ggml-bitnet-mad.cpp
+@@ -8,11 +8,13 @@
+ #include <cmath>
+ #include <cstring>
+ 
+-#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
++// Canonical i2_s block size: every 128 weights are packed into 32 bytes,
++// regardless of the target ISA. (The old code used 64 under __ARM_NEON, which
++// encoded a different, incompatible on-disk layout — see the note on the
++// scalar helper below.) Defined unconditionally so the portable scalar path
++// compiles on targets with no SIMD ISA (generic host build, Android x86_64
++// without -mavx2, etc.).
+ #define QK_I2_S 128
+-#elif defined(__ARM_NEON)
+-#define QK_I2_S 64
+-#endif
+ 
+ #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
+ #include <immintrin.h>
+@@ -48,112 +50,69 @@ static inline int hsum_i32_8(const __m256i a) {
+ }
+ #endif
+ 
+-size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+-#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
+-#if defined(ACT_PARALLEL)
+-    size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
+-
+-    int n = nrow * n_per_row;
+-
+-    // f32 -> q8
+-    double max = 0;
+-    for (int i = 0; i < n; ++i) {
+-        max = fmax(max, (double)fabs((double)src[i]));
+-    }
+-    double i2_scale = max;
+-
+-    uint8_t* q8 = (uint8_t*)malloc(n * sizeof(uint8_t));
+-    for (int i=0; i<n; i++) {
+-        if (fabs((double)(src[i])) < 1e-6) {
+-            q8[i] = 1;
+-            continue;
+-        }
+-        q8[i] = (double)src[i] * i2_scale > 0 ? 2 : 0;
+-    }
+-
+-    memset(dst, 0, n * sizeof(uint8_t) / 4);
+-
+-    // q8 -> 0, 1, 2
+-    //       |  |  |
+-    //      -1, 0, 1
+-
+-    uint8_t* i2_weight = (uint8_t*)dst;
+-    for (int i = 0; i < n / QK_I2_S; i++) {
+-        for (int j = 0; j < QK_I2_S; j++) {
+-            int group_idx = j / 32;
+-            int group_pos = j % 32;
+-            uint8_t temp = (q8[i * QK_I2_S + j] << (6 - 2 * group_idx));
+-            i2_weight[i * 32 + group_pos] |= temp;            
+-        }
+-    }
+-
+-    float* scale_ptr = (float*)((char*)i2_weight + n / 4);
+-    scale_ptr[0] = i2_scale;
+-
+-    free(q8);
+-
+-    // 32B for alignment
+-    return nrow * row_size / 4 + 32;
+-#else
+-    assert((nrow % 4) == 0 && "quantize_i2_s_1x4 requires nrow % 4 == 0");
+-
+-    size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
+-    int64_t n = nrow * n_per_row;
+-
+-    double max = 0;
+-    for (int64_t i = 0; i < n; ++i) {
+-        max = fmax(max, (double)fabs((double)src[i]));
+-    }
+-    double i2_scale = max;
+-
+-    uint8_t* q8 = (uint8_t*)malloc(n * sizeof(uint8_t));
+-    for (int64_t i=0; i<n; i++) {
+-        if (fabs((double)(src[i])) < 1e-6) {
+-            q8[i] = 1;
+-            continue;
+-        }
+-        q8[i] = (double)src[i] * i2_scale > 0 ? 2 : 0;
+-    }
+-
+-    uint8_t* out = (uint8_t*)dst;
+-    memset(out, 0, (size_t)(n / 4));
+-
+-    // for each group of 4 rows, for each column, write one byte
+-    int64_t nrow4 = nrow / 4;
+-    for (int64_t rg = 0; rg < nrow4; rg++) {
+-        int64_t r0 = rg * 4 + 0;
+-        int64_t r1 = rg * 4 + 1;
+-        int64_t r2 = rg * 4 + 2;
+-        int64_t r3 = rg * 4 + 3;
+-
+-        int64_t base = rg * n_per_row;
+-
+-        for (int64_t col = 0; col < n_per_row; col++) {
+-            uint8_t q0 = q8[r0 * n_per_row + col];
+-            uint8_t q1 = q8[r1 * n_per_row + col];
+-            uint8_t q2 = q8[r2 * n_per_row + col];
+-            uint8_t q3 = q8[r3 * n_per_row + col];
+-
+-            uint8_t packed = (uint8_t)((q0 << 6) | (q1 << 4) | (q2 << 2) | (q3 << 0));
+-            out[base + col] = packed;
++// ---------------------------------------------------------------------------
++// Portable scalar i2_s row dot product.
++//
++// Canonical i2_s layout (matches the AVX2 kernels below and
++// dequantize_row_i2_s in ggml-quants.c): each 128-weight block occupies 32
++// bytes; within a block, byte b holds the four 2-bit codes for weights
++// b, 32+b, 64+b, 96+b at bit shifts 6, 4, 2, 0 respectively. Codes are
++// UNSIGNED {0,1,2} == (ternary weight + 1); the caller removes the +1 bias
++// afterwards via act_sums / act_scales (see ggml.c forward_mul_mat).
++//
++// `n` is assumed to be a multiple of 128 — true for every BitNet tensor
++// reduction dim (e.g. 2560, 6912). Any partial tail is ignored, exactly as
++// the AVX2 kernels do (they iterate n/128 full blocks).
++static inline int32_t bitnet_row_dot_i2_i8(const uint8_t * xr, const int8_t * y, int n) {
++    int32_t sumi = 0;
++    const int nb = n / 128;
++    for (int i = 0; i < nb; ++i) {
++        const uint8_t * px = xr + (size_t)i * 32;
++        const int8_t  * py = y  + (size_t)i * 128;
++        for (int b = 0; b < 32; ++b) {
++            const uint8_t w = px[b];
++            sumi += (int32_t)((w >> 6) & 3) * (int32_t)py[b];
++            sumi += (int32_t)((w >> 4) & 3) * (int32_t)py[b + 32];
++            sumi += (int32_t)((w >> 2) & 3) * (int32_t)py[b + 64];
++            sumi += (int32_t)( w       & 3) * (int32_t)py[b + 96];
+         }
+     }
++    return sumi;
++}
+ 
+-    // store scale at the end of quantized data (same location pattern as quantize_i2_s)
+-    float* scale_ptr = (float*)((char*)out + n / 4);
+-    scale_ptr[0] = (float)i2_scale;
+-
+-    free(q8);
+-
+-    // return size (keep same formula as quantize_i2_s)
+-    return nrow * row_size / 4 + 32;
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && !defined(BITNET_MAD_FORCE_SCALAR)
++// Accumulate one canonical 128-weight block (32 weight bytes at px, 128 int8
++// activations at py) into a 4-lane int32 accumulator using the ARMv8.2 dot
++// product instruction. Faithful NEON transcription of the verified AVX2 math.
++static inline int32x4_t bitnet_dot_block_neon(int32x4_t accu, const uint8_t * px, const int8_t * py) {
++    const uint8x16_t mask = vdupq_n_u8(3);
++    const uint8x16_t lo = vld1q_u8(px);
++    const uint8x16_t hi = vld1q_u8(px + 16);
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(lo, 6), mask)), vld1q_s8(py + 0));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(hi, 6), mask)), vld1q_s8(py + 16));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(lo, 4), mask)), vld1q_s8(py + 32));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(hi, 4), mask)), vld1q_s8(py + 48));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(lo, 2), mask)), vld1q_s8(py + 64));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(hi, 2), mask)), vld1q_s8(py + 80));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(lo, mask)),                vld1q_s8(py + 96));
++    accu = vdotq_s32(accu, vreinterpretq_s8_u8(vandq_u8(hi, mask)),                vld1q_s8(py + 112));
++    return accu;
++}
+ #endif
+-#elif defined(__ARM_NEON)
++
++size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
++    // Portable, single-layout i2_s quantizer. Produces the canonical layout
++    // consumed by bitnet_row_dot_i2_i8 and the AVX2/NEON kernels: 128 weights
++    // -> 32 bytes, byte b holds codes for weights b, 32+b, 64+b, 96+b at bit
++    // shifts 6, 4, 2, 0. (The previous version had an __ARM_NEON branch that
++    // wrote a different stride-16 layout, which corrupted GGUFs quantized on
++    // ARM, and a dead non-ACT_PARALLEL 1x4-interleaved branch.)
++    (void)quant_weights;
+     size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
+ 
+     int n = nrow * n_per_row;
+ 
+-    // f32 -> q8
++    // f32 -> code {0,1,2} (== ternary weight {-1,0,+1} + 1)
+     double max = 0;
+     for (int i = 0; i < n; ++i) {
+         max = fmax(max, (double)fabs((double)src[i]));
+@@ -161,7 +120,7 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+     double i2_scale = max;
+ 
+     uint8_t* q8 = (uint8_t*)malloc(n * sizeof(uint8_t));
+-    for (int i=0; i<n; i++) {
++    for (int i = 0; i < n; i++) {
+         if (fabs((double)(src[i])) < 1e-6) {
+             q8[i] = 1;
+             continue;
+@@ -171,17 +130,13 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+ 
+     memset(dst, 0, n * sizeof(uint8_t) / 4);
+ 
+-    // q8 -> 0, 1, 2
+-    //       |  |  |
+-    //      -1, 0, 1
+-
+     uint8_t* i2_weight = (uint8_t*)dst;
+     for (int i = 0; i < n / QK_I2_S; i++) {
+         for (int j = 0; j < QK_I2_S; j++) {
+-            int group_idx = j / 16;
+-            int group_pos = j % 16;
++            int group_idx = j / 32;
++            int group_pos = j % 32;
+             uint8_t temp = (q8[i * QK_I2_S + j] << (6 - 2 * group_idx));
+-            i2_weight[i * 16 + group_pos] |= temp;            
++            i2_weight[i * 32 + group_pos] |= temp;
+         }
+     }
+ 
+@@ -192,7 +147,6 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+ 
+     // 32B for alignment
+     return nrow * row_size / 4 + 32;
+-#endif
+ }
+ 
+ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+@@ -294,119 +248,29 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
+         int sumi = hsum_i32_8(accu);
+         s[row] = (float)sumi;
+     }
+-#elif defined(__ARM_NEON)
+-    const uint8_t *    x = (uint8_t *)vx;
+-    const int8_t  *    y = (int8_t *)vy;
+-
+-    const int nb = n / QK_I2_S;
+-    const int group32_num = nb / 32;
+-    const int la_num = nb % 32;
+-    const int groupla_num = nb % 32 != 0 ? 1 : 0;
+-
+-    const uint8x16_t mask = vdupq_n_u8(3);
+-
+-    // 处理多列，nrc表示要处理的列数
++#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && !defined(BITNET_MAD_FORCE_SCALAR)
++    // Canonical-layout NEON (dotprod). nrc = number of weight rows; row r's
++    // packed weights start at vx + r*bx/4 bytes; single shared activation
++    // vector vy; output s[row] (bs intentionally ignored, matching the AVX2
++    // kernel — the gemv path relies on this).
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t *)vy;
++    const int nb = n / 128;
+     for (int row = 0; row < nrc; row++) {
++        const uint8_t * x_row = x + (size_t)row * bx / 4;
+         int32x4_t accu = vdupq_n_s32(0);
+-
+-        // 计算当前行的x指针偏移
+-        const uint8_t * x_row = x + row * bx / 4;
+-
+-        for (int i=0; i < group32_num; i++) {
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            int16x8_t accu32 = vdupq_n_s16(0);
+-#endif
+-            for (int j=0; j < 32; j++) {
+-                uint8x16_t xq8_3 = vld1q_u8(x_row + i * 32 * 16 + j * 16);
+-                uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-                int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-
+-                const int8x16_t yq8_0 = vld1q_s8(y + i * 32 * 64 + j * 64 + 0);
+-                const int8x16_t yq8_1 = vld1q_s8(y + i * 32 * 64 + j * 64 + 16);
+-                const int8x16_t yq8_2 = vld1q_s8(y + i * 32 * 64 + j * 64 + 32);
+-                const int8x16_t yq8_3 = vld1q_s8(y + i * 32 * 64 + j * 64 + 48);
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                accu = vdotq_s32(accu, q8_0, yq8_0);
+-                accu = vdotq_s32(accu, q8_1, yq8_1);
+-                accu = vdotq_s32(accu, q8_2, yq8_2);
+-                accu = vdotq_s32(accu, q8_3, yq8_3);
+-#else
+-                accu32 = vmlal_s8(accu32, vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                accu32 = vmlal_s8(accu32, vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-                accu32 = vmlal_s8(accu32, vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                accu32 = vmlal_s8(accu32, vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                accu32 = vmlal_s8(accu32, vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                accu32 = vmlal_s8(accu32, vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                accu32 = vmlal_s8(accu32, vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                accu32 = vmlal_s8(accu32, vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-#endif
+-            }
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            accu = vaddq_s32(accu, vmovl_s16(vget_low_s16(accu32)));
+-            accu = vaddq_s32(accu, vmovl_high_s16(accu32));
+-#endif
++        for (int i = 0; i < nb; i++) {
++            accu = bitnet_dot_block_neon(accu, x_row + (size_t)i * 32, y + (size_t)i * 128);
+         }
+-
+-        for (int i = 0; i < groupla_num; i++){
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            int16x8_t accula = vdupq_n_s16(0);
+-#endif
+-            for (int j = 0; j < la_num; j++) {
+-                uint8x16_t xq8_3 = vld1q_u8(x_row + group32_num * 32 * 16 + j * 16);
+-                uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-                int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-
+-                const int8x16_t yq8_0 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 0);
+-                const int8x16_t yq8_1 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 16);
+-                const int8x16_t yq8_2 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 32);
+-                const int8x16_t yq8_3 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 48);
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                accu = vdotq_s32(accu, q8_0, yq8_0);
+-                accu = vdotq_s32(accu, q8_1, yq8_1);
+-                accu = vdotq_s32(accu, q8_2, yq8_2);
+-                accu = vdotq_s32(accu, q8_3, yq8_3);
+-#else
+-                accula = vmlal_s8(accula, vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                accula = vmlal_s8(accula, vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-                accula = vmlal_s8(accula, vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                accula = vmlal_s8(accula, vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                accula = vmlal_s8(accula, vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                accula = vmlal_s8(accula, vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                accula = vmlal_s8(accula, vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                accula = vmlal_s8(accula, vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-#endif
+-            }
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
++        s[row] = (float)vaddvq_s32(accu);
++    }
+ #else
+-            accu = vaddq_s32(accu, vmovl_s16(vget_low_s16(accula)));
+-            accu = vaddq_s32(accu, vmovl_high_s16(accula));
+-#endif
+-        }
+-        int sumi = vaddlvq_s32(accu);
+-        s[row] = (float)sumi;
++    // Portable scalar fallback (x86 without AVX2, ARM without dotprod, or any
++    // host build with no SIMD ISA). nrc = weight rows; output s[row].
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t *)vy;
++    for (int row = 0; row < nrc; row++) {
++        s[row] = (float)bitnet_row_dot_i2_i8(x + (size_t)row * bx / 4, y, n);
+     }
+ #endif
+ }
+@@ -504,8 +368,11 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx,
+             s[row + rb] = (float)sumi;
+         }
+     }
+-#elif defined(__ARM_NEON)
+-
++#else
++    // Dead code: this variant has no callers, and its 1x4-interleaved weight
++    // layout differs from the canonical layout, so there is no scalar port.
++    (void)n; (void)s; (void)bs; (void)vx; (void)bx; (void)vy; (void)by; (void)nrc;
++    assert(0 && "ggml_vec_dot_i2_i8_s_1x4_32W is not implemented for this target");
+ #endif
+ }
+ 
+@@ -631,159 +498,14 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
+             s[row + rb] = (float)sumi;
+         }
+     }
+-#elif defined(__ARM_NEON)
+-    const uint8_t *    x = (uint8_t *)vx;
+-    const int8_t  *    y = (int8_t *)vy;
+-
+-    const int nb = n / QK_I2_S;
+-    const int group32_num = nb / 32;
+-    const int la_num = nb % 32;
+-    const int groupla_num = nb % 32 != 0 ? 1 : 0;
+-    
+-    const uint8x16_t mask = vdupq_n_u8(3);
+-
+-    // 处理多行，nrc表示要处理的行数
+-    for (int row = 0; row < nrc; row += PARALLEL_SIZE) {
+-
+-        int32x4_t accu[PARALLEL_SIZE];
+-        const uint8_t * x_row[PARALLEL_SIZE];
+-        
+-        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-            accu[rb] = vdupq_n_s32(0);
+-            x_row[rb] = x + (row + rb) * bx / 4;
+-        }
+-
+-        for (int i = 0; i < group32_num; i++) {
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+ #else
+-            int16x8_t accu32[PARALLEL_SIZE];
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                accu32[rb] = vdupq_n_s16(0);
+-            }
+-#endif
+-            const uint8_t * px[PARALLEL_SIZE];
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                px[rb] = x_row[rb] + i * 32 * 16;
+-            }
+-
+-            for (int j = 0; j < 32; j++) {
+-                // 加载 y 数据（对所有行共享）
+-                const int8x16_t yq8_0 = vld1q_s8(y + i * 32 * 64 + j * 64 + 0);
+-                const int8x16_t yq8_1 = vld1q_s8(y + i * 32 * 64 + j * 64 + 16);
+-                const int8x16_t yq8_2 = vld1q_s8(y + i * 32 * 64 + j * 64 + 32);
+-                const int8x16_t yq8_3 = vld1q_s8(y + i * 32 * 64 + j * 64 + 48);
+-
+-                // 处理每一行
+-                for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                    uint8x16_t xq8_3 = vld1q_u8(px[rb] + 0);
+-                    uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                    uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                    uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                    int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-                    int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                    int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                    int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                    accu[rb] = vdotq_s32(accu[rb], q8_0, yq8_0);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_1, yq8_1);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_2, yq8_2);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_3, yq8_3);
+-#else
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                    accu32[rb] = vmlal_s8(accu32[rb], vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-                    
+-#endif
+-                    px[rb] += 16;
+-                }
+-            }
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                accu[rb] = vaddq_s32(accu[rb], vmovl_s16(vget_low_s16(accu32[rb])));
+-                accu[rb] = vaddq_s32(accu[rb], vmovl_high_s16(accu32[rb]));
+-            }
+-#endif
+-        }
+-
+-        for (int i = 0; i < groupla_num; i++) {
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            int16x8_t accula[PARALLEL_SIZE];
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                accula[rb] = vdupq_n_s16(0);
+-            }
+-#endif
+-            const uint8_t * px[PARALLEL_SIZE];
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                px[rb] = x_row[rb] + group32_num * 32 * 16;
+-            }
+-
+-            for (int j = 0; j < la_num; j++) {
+-                // 加载 y 数据（对所有行共享）
+-                const int8x16_t yq8_0 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 0);
+-                const int8x16_t yq8_1 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 16);
+-                const int8x16_t yq8_2 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 32);
+-                const int8x16_t yq8_3 = vld1q_s8(y + group32_num * 32 * 64 + j * 64 + 48);
+-
+-                // 处理每一行
+-                for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                    uint8x16_t xq8_3 = vld1q_u8(px[rb] + 0);
+-                    uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                    uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                    uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                    int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-                    int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                    int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                    int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-                    
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                    accu[rb] = vdotq_s32(accu[rb], q8_0, yq8_0);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_1, yq8_1);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_2, yq8_2);
+-                    accu[rb] = vdotq_s32(accu[rb], q8_3, yq8_3);
+-#else
+-                    accula[rb] = vmlal_s8(accula[rb], vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                    accula[rb] = vmlal_s8(accula[rb], vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-
+-#endif
+-                    px[rb] += 16;
+-                }
+-            }
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-                accu[rb] = vaddq_s32(accu[rb], vmovl_s16(vget_low_s16(accula[rb])));
+-                accu[rb] = vaddq_s32(accu[rb], vmovl_high_s16(accula[rb]));
+-            }
+-#endif
+-        }
+-
+-        // 合并结果并写回
+-        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+-            int sumi = vaddlvq_s32(accu[rb]);
+-            s[row + rb] = (float)sumi;
+-        }
++    // Dead under ACT_PARALLEL (the dispatcher routes multiples of PARALLEL_SIZE
++    // to _Nx1). Portable scalar kept only so no target compiles an empty body.
++    // Same weight-rows semantics as _1x1: nrc rows, output s[row].
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t *)vy;
++    for (int row = 0; row < nrc; row++) {
++        s[row] = (float)bitnet_row_dot_i2_i8(x + (size_t)row * bx / 4, y, n);
+     }
+ #endif
+ }
+@@ -885,172 +607,67 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
+             s[(col + iy) * bs] = (float)sumi;
+         }
+     }
+-#elif defined(__ARM_NEON)
+-    const uint8_t *    x = (uint8_t *)vx;
+-    const int8_t  *    y = (int8_t *)vy;
+-
+-    const int nb = n / QK_I2_S;
+-    const int group32_num = nb / 32;
+-    const int la_num = nb % 32;
+-    const int groupla_num = nb % 32 != 0 ? 1 : 0;
+-
+-    const uint8x16_t mask = vdupq_n_u8(3);
+-
+-    for (int col = 0; col < nrc; col += PARALLEL_SIZE) {
+-        int32x4_t accu[PARALLEL_SIZE];
+-
+-        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-            accu[iy] = vdupq_n_s32(0);
+-        }
+-
+-        const int8_t * y_col = y + col * by;
+-        
+-        for (int i = 0; i < group32_num; i++) {
+-            const uint8_t *px = x + i * 512;     // i * 32 * 16
+-            const int8_t  *py = y_col + i * 2048; // i * 32 * 64
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            int16x8_t accu32[PARALLEL_SIZE];
+-
+-            for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                accu32[iy] = vdupq_n_s16(0);
+-            }
+-#endif
+-            for (int j = 0; j < 32; j++) {
+-                // 加载并解包 x 数据（对所有列共享）
+-                uint8x16_t xq8_3 = vld1q_u8(px + 0);
+-                uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-                int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-
+-                // 处理每一列
+-                for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                    const int8x16_t yq8_0 = vld1q_s8(py + 0 * 16 + iy * by);
+-                    const int8x16_t yq8_1 = vld1q_s8(py + 1 * 16 + iy * by);
+-                    const int8x16_t yq8_2 = vld1q_s8(py + 2 * 16 + iy * by);
+-                    const int8x16_t yq8_3 = vld1q_s8(py + 3 * 16 + iy * by);
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                    accu[iy] = vdotq_s32(accu[iy], q8_0, yq8_0);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_1, yq8_1);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_2, yq8_2);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_3, yq8_3);
+-#else
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                    accu32[iy] = vmlal_s8(accu32[iy], vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-#endif
+-                }
+-
+-                px += 16;
+-                py += 64;
+-            }
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                accu[iy] = vaddq_s32(accu[iy], vaddq_s32(vmovl_high_s16(accu32[iy]), vmovl_s16(vget_low_s16(accu32[iy]))));
+-            }
+-#endif
++#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && !defined(BITNET_MAD_FORCE_SCALAR)
++    // Canonical-layout NEON (dotprod). ONE shared weight row vx; nrc = number
++    // of activation vectors, column c at vy + c*by; output s[c*bs].
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t *)vy;
++    const int nb = n / 128;
++    for (int col = 0; col < nrc; col++) {
++        const int8_t * y_col = y + (size_t)col * by;
++        int32x4_t accu = vdupq_n_s32(0);
++        for (int i = 0; i < nb; i++) {
++            accu = bitnet_dot_block_neon(accu, x + (size_t)i * 32, y_col + (size_t)i * 128);
+         }
+-
+-        for (int i = 0; i < groupla_num; i++) {
+-            const uint8_t *px = x + group32_num * 512;
+-            const int8_t  *py = y_col + group32_num * 2048;
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
+-#else
+-            int16x8_t accula[PARALLEL_SIZE];
+-
+-            for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                accula[iy] = vdupq_n_s16(0);
+-            }
+-#endif
+-            
+-            for (int j = 0; j < la_num; j++) {
+-                // 加载并解包 x 数据（对所有列共享）
+-                uint8x16_t xq8_3 = vld1q_u8(px + 0);
+-                uint8x16_t xq8_2 = vshrq_n_u8(xq8_3, 2);
+-                uint8x16_t xq8_1 = vshrq_n_u8(xq8_3, 4);
+-                uint8x16_t xq8_0 = vshrq_n_u8(xq8_3, 6);
+-
+-                int8x16_t q8_0 = vreinterpretq_s8_u8(vandq_u8(xq8_0, mask));
+-                int8x16_t q8_1 = vreinterpretq_s8_u8(vandq_u8(xq8_1, mask));
+-                int8x16_t q8_2 = vreinterpretq_s8_u8(vandq_u8(xq8_2, mask));
+-                int8x16_t q8_3 = vreinterpretq_s8_u8(vandq_u8(xq8_3, mask));
+-
+-                // 处理每一列
+-                for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                    const int8x16_t yq8_0 = vld1q_s8(py + 0 * 16 + iy * by);
+-                    const int8x16_t yq8_1 = vld1q_s8(py + 1 * 16 + iy * by);
+-                    const int8x16_t yq8_2 = vld1q_s8(py + 2 * 16 + iy * by);
+-                    const int8x16_t yq8_3 = vld1q_s8(py + 3 * 16 + iy * by);
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-                    accu[iy] = vdotq_s32(accu[iy], q8_0, yq8_0);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_1, yq8_1);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_2, yq8_2);
+-                    accu[iy] = vdotq_s32(accu[iy], q8_3, yq8_3);
+-#else
+-                    accula[iy] = vmlal_s8(accula[iy], vget_low_s8(q8_0), vget_low_s8(yq8_0));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_high_s8(q8_0), vget_high_s8(yq8_0));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_low_s8(q8_1), vget_low_s8(yq8_1));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_high_s8(q8_1), vget_high_s8(yq8_1));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_low_s8(q8_2), vget_low_s8(yq8_2));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_high_s8(q8_2), vget_high_s8(yq8_2));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_low_s8(q8_3), vget_low_s8(yq8_3));
+-                    accula[iy] = vmlal_s8(accula[iy], vget_high_s8(q8_3), vget_high_s8(yq8_3));
+-#endif
+-                }
+-
+-                px += 16;
+-                py += 64;
+-            }
+-
+-#if defined(__ARM_FEATURE_DOTPROD)
+-
++        s[(size_t)col * bs] = (float)vaddvq_s32(accu);
++    }
+ #else
+-            for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-                accu[iy] = vaddq_s32(accu[iy], vaddq_s32(vmovl_high_s16(accula[iy]), vmovl_s16(vget_low_s16(accula[iy]))));
+-            }
+-#endif
+-        }
+-
+-        // 合并结果并写回
+-        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+-            int sumi = vaddlvq_s32(accu[iy]);
+-            s[(col + iy) * bs] = (float)sumi;
+-        }
++    // Portable scalar fallback. ONE weight row; nrc activation columns.
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t *)vy;
++    for (int col = 0; col < nrc; col++) {
++        s[(size_t)col * bs] = (float)bitnet_row_dot_i2_i8(x, y + (size_t)col * by, n);
+     }
+ #endif
+ }
+ 
+ 
+ void ggml_vec_dot_i2_i8_s(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
++#if defined(ACT_PARALLEL)
+     if (nrc % PARALLEL_SIZE == 0)
+     {
+-#if defined(ACT_PARALLEL)
+         ggml_vec_dot_i2_i8_s_Nx1(n, s, bs, vx, bx, vy, by, nrc);
++    }
++    else
++    {
++        // Tail block: nrc is not a multiple of PARALLEL_SIZE. Under ACT_PARALLEL
++        // every caller (gemv with nrc==1, gemm with nrc==cur_r activation rows)
++        // means the SAME thing: ONE weight row (vx) dotted against nrc activation
++        // columns (vy + col*by). That is exactly _Nx1's contract.
++        //
++        // The AVX2 _Nx1 processes PARALLEL_SIZE columns per iteration and cannot
++        // handle a tail, so on that target the historical fallback routes the
++        // tail to _1x1 (kept byte-identical here so the shipped Android x86_64
++        // and arm64 libraries are unchanged). But the scalar and NEON-dotprod
++        // _Nx1 iterate one column at a time and handle any nrc — so for those
++        // targets _Nx1 is both correct and safe. Routing the tail to _1x1 there
++        // was a real bug: _1x1 treats nrc as *weight rows* and reads vx past the
++        // end of the weight matrix, which traps on bounds-checked WebAssembly
++        // (and silently corrupts the tail rows' logits elsewhere).
++#if defined(__AVX2__) || (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && !defined(BITNET_MAD_FORCE_SCALAR))
++        ggml_vec_dot_i2_i8_s_1x1(n, s, bs, vx, bx, vy, by, nrc);
++#else
++        ggml_vec_dot_i2_i8_s_Nx1(n, s, bs, vx, bx, vy, by, nrc);
++#endif
++    }
+ #else
++    if (nrc % PARALLEL_SIZE == 0)
++    {
+         ggml_vec_dot_i2_i8_s_1xN(n, s, bs, vx, bx, vy, by, nrc);
+-#endif
+     }
+     else
+     {
+         ggml_vec_dot_i2_i8_s_1x1(n, s, bs, vx, bx, vy, by, nrc);
+     }
++#endif
+ }
+\ No newline at end of file
