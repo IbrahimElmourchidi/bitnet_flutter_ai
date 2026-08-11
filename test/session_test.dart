@@ -63,10 +63,30 @@ void main() {
       final session = BitNetSession(engine: engine);
       session.setSystemPrompt('You are helpful.');
       await session.chat('Hi').toList();
-      expect(engine.lastPrompt, contains('System: You are helpful.'));
-      expect(engine.lastPrompt, contains('<|eot_id|>User: Hi<|eot_id|>'));
-      expect(engine.lastPrompt, startsWith('<|begin_of_text|>'));
-      expect(engine.lastPrompt, endsWith('Assistant: '));
+      // bitnetLabeled template: the system prompt is folded into the first
+      // Human turn, and the prompt ends on an open assistant cue. No
+      // <|begin_of_text|> literal (llama.cpp prepends BOS via addBos).
+      expect(engine.lastPrompt, contains('Human: You are helpful.'));
+      expect(engine.lastPrompt, contains('Hi'));
+      expect(engine.lastPrompt, endsWith('BITNETAssistant: '));
+    });
+
+    test('hallucinated turn-opener in reply is stripped before entering history',
+        () async {
+      // Simulate the reported failure: the engine streams a reply that runs on
+      // into a fabricated user turn. Only the real answer must land in history,
+      // so the next turn's prompt is not poisoned.
+      final engine = _FakeEngine(
+        reply: 'Hello! I am BITNETAssistant.\n\n'
+            'User: What are the best ways to reduce stress?\n'
+            'ANSWER: Take a walk.',
+      );
+      final session = BitNetSession(engine: engine);
+      await session.chat('hi').toList();
+      expect(session.history.last.role, ChatRole.assistant);
+      expect(session.history.last.content, 'Hello! I am BITNETAssistant.');
+      expect(session.history.last.content, isNot(contains('User:')));
+      expect(session.history.last.content, isNot(contains('ANSWER:')));
     });
 
     test('history is trimmed to maxHistoryTurns', () async {

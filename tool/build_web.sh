@@ -54,6 +54,26 @@ else
     exit 1
 fi
 
+# 0003: removes the I2_S gemm prefill scratch VLA, which was sized
+# (rows-per-thread * n_ubatch) floats — hundreds of KB — and is the reason
+# STACK_SIZE below had to be raised to 32 MB. The kernel now accumulates
+# straight into dst, so prefill stack use no longer scales with the prompt.
+# (Native targets need this to avoid overrunning ggml's 512 KB–1 MB worker
+# thread stacks outright; on wasm it just removes the stack pressure.)
+PATCH3="$PKG_ROOT/native/patches/0003-i2s-gemm-no-stack-vla.patch"
+LLAMA_SUB="$BITNET_CPP/3rdparty/llama.cpp"
+if [[ -f "$PATCH3" ]]; then
+    if git -C "$LLAMA_SUB" apply --check "$PATCH3" 2>/dev/null; then
+        git -C "$LLAMA_SUB" apply "$PATCH3"
+        echo "Applied 0003 i2s gemm no-stack-VLA patch to $LLAMA_SUB"
+    elif git -C "$LLAMA_SUB" apply --check --reverse "$PATCH3" 2>/dev/null; then
+        echo "0003 i2s gemm no-stack-VLA patch already applied to $LLAMA_SUB"
+    else
+        echo "ERROR: 0003 patch does not apply cleanly to $LLAMA_SUB." >&2
+        exit 1
+    fi
+fi
+
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 BUILD_DIR="$BITNET_CPP/build-web"
 

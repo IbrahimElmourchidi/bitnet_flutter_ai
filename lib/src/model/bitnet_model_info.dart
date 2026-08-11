@@ -56,8 +56,9 @@ enum BitNetQuantization {
 /// declares the family its GGUF expects. Resolved to a concrete
 /// `ChatTemplateSpec` by `kChatTemplates` in `session/chat_templates.dart`.
 enum ChatTemplateFamily {
-  /// BitNet b1.58 2B-4T: `System: `/`User: `/`Assistant: ` word labels with
-  /// `<|eot_id|>` turn terminators. The original (and default) template.
+  /// BitNet b1.58 2B-4T: `Human: ` / `BITNETAssistant: ` labels separated by a
+  /// blank line, assistant turns terminated by EOS (`<|end_of_text|>`). Matches
+  /// the chat_template embedded in the official GGUF. The default template.
   bitnetLabeled,
 
   /// Falcon3 Instruct: `<|system|>` / `<|user|>` / `<|assistant|>` tags,

@@ -56,7 +56,15 @@ final class _CmdCancel extends _Cmd {
   _CmdCancel(this.requestId);
 }
 
-final class _CmdDispose extends _Cmd {}
+final class _CmdDispose extends _Cmd {
+  /// Acked with [_MsgDisposed] once the native context has actually been freed.
+  /// The caller MUST wait for that ack before killing the isolate: killing it
+  /// releases the Dart heap but NOT the native allocations behind the context
+  /// (model weights + KV cache — over a gigabyte), so a kill that races ahead
+  /// of bn_free leaks all of it for the lifetime of the process.
+  final SendPort replyPort;
+  _CmdDispose(this.replyPort);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -81,11 +89,31 @@ final class _MsgInitOk extends _Msg {
   _MsgInitOk();
 }
 
+/// Ack for [_CmdDispose]: the native context has been freed and the worker's
+/// port is closed.
+final class _MsgDisposed extends _Msg {
+  _MsgDisposed();
+}
+
 final class _MsgError extends _Msg {
   final String code;
   final String message;
-  _MsgError(this.code, this.message);
+
+  /// The descriptive error string from the native layer (out_err), when the
+  /// underlying exception carried one. Kept separate from [code] (a coarse
+  /// Dart-side category like 'prompt_failed') so the real cause survives the
+  /// isolate boundary and reaches the UI.
+  final String? nativeError;
+  _MsgError(this.code, this.message, {this.nativeError});
 }
+
+/// Extracts the native out_err string from whichever BitNetException subtype
+/// carries one, so it can be forwarded across the isolate boundary.
+String? _nativeErrorOf(Object e) => switch (e) {
+      BitNetInitException(:final nativeError) => nativeError,
+      BitNetInferenceException(:final nativeError) => nativeError,
+      _ => null,
+    };
 
 // ---------------------------------------------------------------------------
 // Isolate entry point
@@ -97,6 +125,10 @@ void _workerEntry(SendPort mainPort) {
 
   NativeLibrary? lib;
   var cancelRequestId = -1;
+  // Set by _CmdDispose. A generation loop parked on its inter-token yield
+  // checks this before touching the context again, so bn_free can never race
+  // ahead of an in-flight bn_next_token (which would be a use-after-free).
+  var disposed = false;
 
   // The handler is async so the generation loop can yield to the isolate
   // event loop between tokens (see _CmdGenerate). Without that yield the
@@ -117,7 +149,8 @@ void _workerEntry(SendPort mainPort) {
           cmd.replyPort.send(_MsgInitOk());
         } on BitNetException catch (e) {
           lib = null;
-          cmd.replyPort.send(_MsgError('init_failed', e.message));
+          cmd.replyPort.send(
+              _MsgError('init_failed', e.message, nativeError: _nativeErrorOf(e)));
         } catch (e) {
           lib = null;
           cmd.replyPort.send(_MsgError('init_failed', e.toString()));
@@ -127,7 +160,7 @@ void _workerEntry(SendPort mainPort) {
         final replyPort = cmd.replyPort;
         cancelRequestId = -1;
 
-        if (lib == null) {
+        if (lib == null || disposed) {
           replyPort.send(_MsgError('not_loaded', 'Engine not initialised.'));
           replyPort.send(_MsgDone(0));
           return;
@@ -136,12 +169,17 @@ void _workerEntry(SendPort mainPort) {
         try {
           lib!.feedPrompt(cmd.prompt, addBos: cmd.addBos);
         } on BitNetException catch (e) {
-          replyPort.send(_MsgError('prompt_failed', e.message));
+          replyPort.send(_MsgError('prompt_failed', e.message,
+              nativeError: _nativeErrorOf(e)));
           replyPort.send(_MsgDone(0));
           return;
         }
 
         var count = 0;
+        // Reassembles UTF-8 characters that the tokenizer split across token
+        // pieces (raw byte fragments), so we never hand the stop detector or
+        // the UI a half-decoded code point.
+        final utf8Decoder = Utf8StreamDecoder();
         // Detects this model's end-of-turn markers even when they are split
         // across several token pieces. Markers are template-specific and
         // supplied by the caller (the worker has no ChatTemplateFamily).
@@ -153,38 +191,58 @@ void _workerEntry(SendPort mainPort) {
           // otherwise starve the port for the whole generation.
           await Future<void>.delayed(Duration.zero);
 
-          // Check for cancellation between tokens.
+          // Check for cancellation / teardown between tokens. `disposed` means
+          // the context has already been freed — touching it now would be a
+          // use-after-free, so bail before nextToken().
+          if (disposed) break;
           if (cancelRequestId == cmd.requestId) break;
 
           try {
-            final piece = lib!.nextToken();
-            if (piece == null) {
+            final pieceBytes = lib!.nextToken();
+            if (pieceBytes == null) {
               // EOS
               break;
             }
-            final emit = stopDetector.feed(piece);
-            if (emit.isNotEmpty) {
-              replyPort.send(_MsgToken(emit));
-            }
-            if (stopDetector.stopped) {
-              // A complete end-of-turn marker was assembled — stop without
-              // emitting the marker text itself.
-              break;
+            // Decode bytes → text, buffering any partial UTF-8 sequence so a
+            // character split across pieces is never surfaced half-decoded.
+            final piece = utf8Decoder.add(pieceBytes);
+            if (piece.isNotEmpty) {
+              final emit = stopDetector.feed(piece);
+              if (emit.isNotEmpty) {
+                replyPort.send(_MsgToken(emit));
+              }
+              if (stopDetector.stopped) {
+                // A complete end-of-turn marker was assembled — stop without
+                // emitting the marker text itself.
+                break;
+              }
             }
             count++;
           } on BitNetException catch (e) {
-            replyPort.send(_MsgError('inference_failed', e.message));
+            replyPort.send(_MsgError('inference_failed', e.message,
+                nativeError: _nativeErrorOf(e)));
             replyPort.send(_MsgDone(count));
             return;
           }
         }
 
         // Release any text held back while waiting to see if it was part of a
-        // marker (stream ended via EOS, token cap, or cancellation).
+        // marker (stream ended via EOS, token cap, or cancellation). Drain the
+        // UTF-8 decoder first (its leftover bytes feed the stop detector), then
+        // the stop detector.
         if (!stopDetector.stopped) {
-          final rest = stopDetector.flush();
-          if (rest.isNotEmpty) {
-            replyPort.send(_MsgToken(rest));
+          final tail = utf8Decoder.flush();
+          if (tail.isNotEmpty) {
+            final emit = stopDetector.feed(tail);
+            if (emit.isNotEmpty) {
+              replyPort.send(_MsgToken(emit));
+            }
+          }
+          if (!stopDetector.stopped) {
+            final rest = stopDetector.flush();
+            if (rest.isNotEmpty) {
+              replyPort.send(_MsgToken(rest));
+            }
           }
         }
 
@@ -194,7 +252,13 @@ void _workerEntry(SendPort mainPort) {
         cancelRequestId = cmd.requestId;
 
       case _CmdDispose():
+        // Runs to completion synchronously: any generation loop is parked on
+        // its `await Future.delayed(Duration.zero)` and cannot resume until we
+        // return, so it observes `disposed == true` before its next FFI call.
+        disposed = true;
         lib?.freeContext();
+        lib = null;
+        cmd.replyPort.send(_MsgDisposed());
         receivePort.close();
     }
   });
@@ -214,6 +278,11 @@ class NativeEngine implements BitNetEngine {
   Isolate? _isolate;
   bool _loaded = false;
   int _nextRequestId = 0;
+
+  /// Id of the generation currently in flight, or null when idle. One engine
+  /// owns one native context, so overlapping generations are rejected rather
+  /// than silently interleaved on it (see [BitNetBusyException]).
+  int? _activeRequestId;
 
   @override
   bool get isLoaded => _loaded;
@@ -268,7 +337,7 @@ class NativeEngine implements BitNetEngine {
       _workerPort = null;
       throw BitNetInitException(
         message: initResult.message,
-        nativeError: initResult.code,
+        nativeError: initResult.nativeError ?? initResult.code,
       );
     }
 
@@ -284,10 +353,24 @@ class NativeEngine implements BitNetEngine {
     if (!_loaded || _workerPort == null) {
       throw const BitNetNotLoadedException();
     }
+    if (_activeRequestId != null) {
+      throw const BitNetBusyException();
+    }
 
     final requestId = _nextRequestId++;
+    _activeRequestId = requestId;
     final replyPort = ReceivePort();
     final controller = StreamController<String>();
+
+    // Releases the request slot and the reply port exactly once, whichever
+    // terminal path gets there first (done / error / consumer cancellation).
+    var settled = false;
+    void settle() {
+      if (settled) return;
+      settled = true;
+      if (_activeRequestId == requestId) _activeRequestId = null;
+      replyPort.close();
+    }
 
     _workerPort!.send(_CmdGenerate(
       prompt: prompt,
@@ -316,22 +399,36 @@ class NativeEngine implements BitNetEngine {
           BitNetLog.log('engine',
               'done req=$requestId tokens=${msg.tokensGenerated} '
               '(seen=$tokenCount)');
+          settle();
           controller.close();
-          replyPort.close();
         case _MsgError():
           BitNetLog.log('engine',
-              'error req=$requestId code=${msg.code} message=${msg.message}');
+              'error req=$requestId code=${msg.code} message=${msg.message} '
+              'native=${msg.nativeError}');
           controller.addError(BitNetInferenceException(
             message: msg.message,
-            nativeError: msg.code,
+            nativeError: msg.nativeError ?? msg.code,
           ));
+          settle();
           controller.close();
-          replyPort.close();
         case _MsgReady():
         case _MsgInitOk():
+        case _MsgDisposed():
           break; // unexpected here, ignore
       }
     });
+
+    // The consumer walking away (widget disposed, tab switched, `await for`
+    // broken out of) must actually stop the worker. Without this the isolate
+    // decodes all the way to maxNewTokens at 100% CPU with nobody listening,
+    // and the reply port is never closed.
+    controller.onCancel = () {
+      if (!settled) {
+        BitNetLog.log('engine', 'stream cancelled req=$requestId — stopping');
+        _workerPort?.send(_CmdCancel(requestId));
+      }
+      settle();
+    };
 
     return controller.stream;
   }
@@ -347,17 +444,47 @@ class NativeEngine implements BitNetEngine {
 
   @override
   Future<void> cancelGeneration() async {
-    if (_workerPort == null || _nextRequestId == 0) return;
-    _workerPort!.send(_CmdCancel(_nextRequestId - 1));
+    // Target the generation that is actually running. Cancelling by
+    // `_nextRequestId - 1` would also fire when idle, arming the worker
+    // against an id it may never see again.
+    final active = _activeRequestId;
+    if (_workerPort == null || active == null) return;
+    _workerPort!.send(_CmdCancel(active));
   }
 
   @override
   Future<void> dispose() async {
-    _workerPort?.send(_CmdDispose());
-    _isolate?.kill(priority: Isolate.immediate);
-    _workerPort = null;
-    _isolate = null;
+    final port = _workerPort;
     _loaded = false;
+    _workerPort = null;
+
+    if (port != null) {
+      // Stop any in-flight generation first so the worker is not mid-decode
+      // when the context goes away.
+      final active = _activeRequestId;
+      if (active != null) port.send(_CmdCancel(active));
+
+      // Wait for bn_free to actually run before killing the isolate. Killing
+      // an isolate reclaims its Dart heap but NOT the native model weights and
+      // KV cache behind the context, so a kill that outruns the dispose
+      // message leaks well over a gigabyte per model switch. Bounded, with the
+      // kill below as the backstop for a wedged worker.
+      final ack = ReceivePort();
+      port.send(_CmdDispose(ack.sendPort));
+      await ack.first.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          BitNetLog.log('engine',
+              'dispose ack timed out — killing isolate (native memory may leak)');
+          return _MsgDisposed();
+        },
+      );
+      ack.close();
+    }
+
+    _activeRequestId = null;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
   }
 }
 

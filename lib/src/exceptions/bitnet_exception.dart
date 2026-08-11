@@ -99,3 +99,16 @@ final class BitNetNotLoadedException extends BitNetException {
 final class BitNetIsolateException extends BitNetException {
   const BitNetIsolateException(super.message);
 }
+
+/// [BitNetEngine.generate] was called while another generation is still in
+/// flight on the same engine.
+///
+/// A single engine owns ONE native context; two overlapping generations would
+/// interleave `bn_prompt` / `bn_next_token` calls on it and split one decode
+/// stream between two consumers, corrupting both. Await or cancel the active
+/// stream (`BitNetSession.stop()`) before starting the next one.
+final class BitNetBusyException extends BitNetException {
+  const BitNetBusyException()
+      : super('A generation is already in progress on this engine. Await or '
+            'cancel it before calling generate() again.');
+}

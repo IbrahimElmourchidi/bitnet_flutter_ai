@@ -58,6 +58,45 @@ else
     exit 1
 fi
 
+# 0002: the pinned llama.cpp submodule's newer I2_S kernels. Fixes the scalar
+# ggml_vec_dot_i2_i8_s block layout and gates the buggy ggml-cpu-i2s.c GEMM/GEMV
+# fast path to AVX2/AVX512. REQUIRED for correct output on the arm64-v8a ABI
+# (which has no AVX2 and would otherwise emit NaN/degenerate logits, same bug
+# seen on iOS). The x86_64 ABI uses the verified AVX2 kernels either way.
+PATCH2="$PKG_ROOT/native/patches/0002-i2s-arm-scalar-and-fastpath-gate.patch"
+LLAMA_SUB="$BITNET_CPP/3rdparty/llama.cpp"
+if [[ -f "$PATCH2" ]]; then
+    if git -C "$LLAMA_SUB" apply --check "$PATCH2" 2>/dev/null; then
+        git -C "$LLAMA_SUB" apply "$PATCH2"
+        echo "Applied 0002 i2s arm/fastpath patch to $LLAMA_SUB"
+    elif git -C "$LLAMA_SUB" apply --check --reverse "$PATCH2" 2>/dev/null; then
+        echo "0002 i2s arm/fastpath patch already applied to $LLAMA_SUB"
+    else
+        echo "NOTE: 0002 patch does not apply to $LLAMA_SUB — skipping" >&2
+        echo "      (expected for the classic-kernel tree, which needs no I2_S patch)." >&2
+    fi
+fi
+
+# 0003: the classic tree's I2_S gemm prefill path sizes a stack VLA as
+# (rows-per-thread * n_ubatch) floats. ggml's worker threads get the pthread
+# default stack (1 MB on Android, 512 KB on Darwin), so a prompt long enough to
+# fill the micro-batch overruns it and the process dies with SIGBUS/SIGSEGV
+# inside ggml_vec_dot_i2_i8_s — writing past the thread's stack guard page. The
+# patch makes the kernel accumulate straight into dst, so prefill stack use no
+# longer scales with the prompt. REQUIRED on every platform.
+PATCH3="$PKG_ROOT/native/patches/0003-i2s-gemm-no-stack-vla.patch"
+if [[ -f "$PATCH3" ]]; then
+    if git -C "$LLAMA_SUB" apply --check "$PATCH3" 2>/dev/null; then
+        git -C "$LLAMA_SUB" apply "$PATCH3"
+        echo "Applied 0003 i2s gemm no-stack-VLA patch to $LLAMA_SUB"
+    elif git -C "$LLAMA_SUB" apply --check --reverse "$PATCH3" 2>/dev/null; then
+        echo "0003 i2s gemm no-stack-VLA patch already applied to $LLAMA_SUB"
+    else
+        echo "ERROR: 0003 patch does not apply cleanly to $LLAMA_SUB." >&2
+        exit 1
+    fi
+fi
+
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 build_abi () {

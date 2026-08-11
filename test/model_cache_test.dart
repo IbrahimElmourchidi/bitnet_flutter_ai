@@ -39,7 +39,7 @@ void main() {
   });
 
   test('ensureModel skips hash check when SHA is placeholder', () async {
-    final placeholderModel = BitNetModelInfo.forTest(
+    const placeholderModel = BitNetModelInfo.forTest(
       id: 'test/fake-model',
       displayName: 'Fake Test Model',
       ggufFileName: 'ggml-model-i2_s.gguf',

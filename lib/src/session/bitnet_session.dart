@@ -94,35 +94,80 @@ class BitNetSession {
         'prompt=${prompt.length}ch maxNewTokens=${maxNewTokens ?? defaultMaxNewTokens}');
     BitNetLog.log('session.prompt', '\n$prompt');
 
-    late StreamSubscription<String> sub;
-    sub = engine
-        .generate(prompt, maxNewTokens: maxNewTokens ?? defaultMaxNewTokens)
-        .listen(
-      (piece) {
-        buffer.write(piece);
-        controller.add(piece);
-      },
-      onError: (Object err, StackTrace st) {
-        BitNetLog.log('session', 'chat() error: $err');
-        // Roll back the user turn on hard failures so the next call doesn't
-        // ship a half-broken history.
-        if (_history.isNotEmpty && _history.last.role == ChatRole.user) {
-          _history.removeLast();
-        }
-        controller.addError(err, st);
-        controller.close();
-      },
-      onDone: () {
-        BitNetLog.log('session',
-            'chat() done reply=${buffer.length}ch: "${_truncate(buffer.toString(), 200)}"');
-        _history.add(ChatTurn(ChatRole.assistant, buffer.toString()));
-        _trimHistory();
-        controller.close();
-      },
-      cancelOnError: true,
-    );
+    // The history must reach exactly one of two end states, exactly once:
+    // either the assistant reply is committed, or the user turn we optimistically
+    // appended above is rolled back. Leaving a user turn with no assistant reply
+    // renders every later prompt as two consecutive user turns, which is
+    // malformed under every template and never recovers.
+    var settled = false;
 
-    controller.onCancel = () => sub.cancel();
+    void commitReply() {
+      if (settled) return;
+      settled = true;
+      // Defensive: if a hallucinated turn-opener slipped past the streaming
+      // TurnStopDetector (e.g. a marker split oddly across pieces, or an
+      // opener variant not in the list), strip it before it enters history.
+      // Without this, one leaked "User: …/ANSWER: …" tail is fed back on every
+      // subsequent turn and derails the whole conversation.
+      final reply = _sanitizeReply(buffer.toString());
+      BitNetLog.log('session',
+          'chat() done reply=${reply.length}ch: "${_truncate(reply, 200)}"');
+      _history.add(ChatTurn(ChatRole.assistant, reply));
+      _trimHistory();
+    }
+
+    void rollbackUserTurn() {
+      if (settled) return;
+      settled = true;
+      if (_history.isNotEmpty && _history.last.role == ChatRole.user) {
+        _history.removeLast();
+      }
+    }
+
+    late StreamSubscription<String> sub;
+    try {
+      sub = engine
+          .generate(prompt, maxNewTokens: maxNewTokens ?? defaultMaxNewTokens)
+          .listen(
+        (piece) {
+          buffer.write(piece);
+          controller.add(piece);
+        },
+        onError: (Object err, StackTrace st) {
+          BitNetLog.log('session', 'chat() error: $err');
+          // Roll back the user turn on hard failures so the next call doesn't
+          // ship a half-broken history.
+          rollbackUserTurn();
+          controller.addError(err, st);
+          controller.close();
+        },
+        onDone: () {
+          commitReply();
+          controller.close();
+        },
+        cancelOnError: true,
+      );
+    } catch (_) {
+      // generate() rejects synchronously when the engine is busy or unloaded,
+      // and the user turn is already in `_history` by then. Undo it before the
+      // error escapes, or the next call renders two consecutive user turns.
+      rollbackUserTurn();
+      rethrow;
+    }
+
+    // Fires when the consumer walks away mid-stream (widget disposed, tab
+    // switched, `await for` broken out of) — onDone never runs in that case, so
+    // the history has to be settled here too. Cancelling `sub` propagates down
+    // to the engine, which stops the worker.
+    controller.onCancel = () async {
+      await sub.cancel();
+      if (buffer.isEmpty) {
+        rollbackUserTurn();
+      } else {
+        BitNetLog.log('session', 'chat() cancelled — committing partial reply');
+        commitReply();
+      }
+    };
     return controller.stream;
   }
 
@@ -216,9 +261,17 @@ class BitNetSession {
   // ---------------------------------------------------------------------
 
   void _trimHistory() {
-    if (_history.length <= maxHistoryTurns) return;
-    final overflow = _history.length - maxHistoryTurns;
-    _history.removeRange(0, overflow);
+    if (_history.length > maxHistoryTurns) {
+      _history.removeRange(0, _history.length - maxHistoryTurns);
+    }
+    // Trimming cuts on a raw entry count, so it can leave the window opening on
+    // an assistant turn. Every template then renders a prompt that starts with a
+    // bare model reply with no user turn before it — out of distribution, and
+    // for `bitnetLabeled` it emits content before the first `Human:` label.
+    // Drop those orphans so the window always starts on a user turn.
+    while (_history.isNotEmpty && _history.first.role == ChatRole.assistant) {
+      _history.removeAt(0);
+    }
   }
 
   static Future<String> _collect(Stream<String> s) async {
@@ -237,15 +290,34 @@ class BitNetSession {
   /// `chat_templates.dart`.
   ///
   /// Each model family was supervised-fine-tuned on a specific format (BitNet's
-  /// `System:`/`User:`/`Assistant:` labels, Falcon3's `<|user|>` tags, ChatML,
-  /// …); feeding the wrong one is out-of-distribution and produces degenerate
-  /// output (a runaway stream of `!`). The per-family formatters live in
-  /// [kChatTemplates]. NOTE: the template embedded in a GGUF's
-  /// `tokenizer.chat_template` metadata can be corrupt (BitNet 2B-4T's emits
-  /// `Human: … BITNETAssistant: …`), so formats are hardcoded per family — do
-  /// NOT drive them from `bn_meta('tokenizer.chat_template')`.
+  /// `Human:`/`BITNETAssistant:` labels, Falcon3's `<|user|>` tags, ChatML, …);
+  /// feeding the wrong one is out-of-distribution and produces wrong or
+  /// degenerate output. The per-family formatters live in [kChatTemplates] and
+  /// mirror each model's embedded `tokenizer.chat_template`; they are hardcoded
+  /// (rather than read via `bn_meta`) so the Dart side controls stop markers and
+  /// history assembly, but they must MATCH the GGUF's template — the BitNet
+  /// 2B-4T one is `Human: … BITNETAssistant: …`, not the old `System:/User:`
+  /// labels (which gave canned, wrong answers).
   String _formatChatPrompt(List<ChatTurn> turns, String? systemPrompt) =>
       chatTemplateFor(model.chatTemplate).format(turns, systemPrompt);
+
+  /// Truncates [reply] at the first hallucinated turn-opener and trims
+  /// surrounding whitespace, so a fabricated next turn never enters history.
+  ///
+  /// The streaming [TurnStopDetector] normally strips these live, but this is a
+  /// belt-and-braces pass on the fully-assembled reply: it uses the SAME stop
+  /// markers as the detector (from the model's [ChatTemplateSpec]) and cuts at
+  /// the earliest one found anywhere in the text. Idempotent and cheap.
+  String _sanitizeReply(String reply) {
+    final markers = chatTemplateFor(model.chatTemplate).stopMarkers;
+    var cut = -1;
+    for (final m in markers) {
+      final idx = reply.indexOf(m);
+      if (idx != -1 && (cut == -1 || idx < cut)) cut = idx;
+    }
+    final trimmed = cut == -1 ? reply : reply.substring(0, cut);
+    return trimmed.trim();
+  }
 
   String _formatInstructionPrompt({
     required String instruction,

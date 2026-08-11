@@ -1,0 +1,74 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ec88ef29a..20c586e7c 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1488,7 +1488,14 @@ UseGgmlGemm1:;
+ UseGgmlGemm2:;
+ #endif
+ 
+-    // I2_S GEMV/GEMM fast path: use optimized SIMD kernels for 2D weight matrices
++    // I2_S GEMV/GEMM fast path: use optimized SIMD kernels for 2D weight matrices.
++    // Gated to AVX2/AVX512 — those are the verified kernels. The non-AVX2 branches
++    // of ggml_gemm_i2_i8_s / ggml_gemv_i2_i8_s produce NaN logits on ARM/iOS
++    // (uninitialized dst rows from the thread-alignment rounding below), so on
++    // ARM and any non-AVX2 target we fall through to the generic ggml mul_mat,
++    // which uses the (now layout-correct) scalar ggml_vec_dot_i2_i8_s and yields
++    // valid logits. Same throughput class on ARM since both go through vec_dot.
++#if defined(__AVX2__) || defined(__AVX512F__)
+     if (src0->type == GGML_TYPE_I2_S && ggml_n_dims(src0) == 2) {
+         const void * src1_wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t i2s_row_size = ggml_row_size(vec_dot_type, ne10);
+@@ -1550,6 +1557,7 @@ UseGgmlGemm2:;
+         }
+         return;
+     }
++#endif // __AVX2__ || __AVX512F__ (I2_S fast path)
+ 
+     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
+     const int64_t nr0 = ne0;
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 603f51c54..5cb4dc179 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1487,17 +1487,33 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
+         s[row] = (float)sumi;
+     }
+ #else
+-    // Scalar fallback
++    // Scalar fallback — MUST match the AVX2 interleaved block layout above and
++    // the AVX2 raw-2bit accumulation (the caller applies (sum - act_sum)*scale,
++    // so we accumulate the RAW 2-bit weight value {0,1,2,3}, NOT a signed map).
++    //
++    // Within each 128-element block (32 packed bytes) the AVX2 kernel reads, for
++    // packed byte k (0..31), four 2-bit fields via >>6,>>4,>>2,>>0 that pair with
++    // activation offsets 0..31, 32..63, 64..95, 96..127 respectively. So element
++    // (f*32 + k) of a block lives in byte k at bit position (6 - 2*f). Any layout
++    // that assumes contiguous 4-per-byte packing (the previous version) reads the
++    // weights transposed and yields degenerate logits on non-AVX2 targets
++    // (ARM/iOS), which is exactly the bn_prompt failure this fixes.
+     const uint8_t * x = (const uint8_t *)vx;
+-    const int8_t * y  = (const int8_t *)vy;
+-    static const int map2bit[4] = { -1, 0, 1, 0 };
++    const int8_t  * y = (const int8_t *)vy;
++    const int nblk = n / 128;               // n is a multiple of QK_I2_S(=128 here)
+     for (int row = 0; row < nrc; row++) {
++        const uint8_t * xr = x + row * (n / 4);
+         int32_t sum = 0;
+-        for (int i = 0; i < n; i++) {
+-            int byte_idx = i / 4;
+-            int bit_pos = 6 - 2 * (i % 4);
+-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
+-            sum += w * y[i];
++        for (int bl = 0; bl < nblk; bl++) {
++            const uint8_t * pb = xr + bl * 32;   // 32 packed bytes per 128 block
++            const int8_t  * yb = y  + bl * 128;  // 128 activations per block
++            for (int k = 0; k < 32; k++) {
++                const uint8_t byte = pb[k];
++                sum += (int32_t)((byte >> 6) & 0x03) * yb[0 * 32 + k];
++                sum += (int32_t)((byte >> 4) & 0x03) * yb[1 * 32 + k];
++                sum += (int32_t)((byte >> 2) & 0x03) * yb[2 * 32 + k];
++                sum += (int32_t)((byte >> 0) & 0x03) * yb[3 * 32 + k];
++            }
+         }
+         s[row] = (float)sum;
+     }

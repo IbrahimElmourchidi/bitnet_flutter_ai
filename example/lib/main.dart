@@ -53,7 +53,15 @@ class _HomePageState extends State<HomePage> {
   BitNetRag? _rag;
   DeviceProfile? _profile;
   BitNetModelInfo _selectedModel = BitNetCatalog.defaultModel;
+  // The model currently loaded into _session, or null if none. Distinct from
+  // _selectedModel so the UI can detect when the selection has diverged and
+  // offer to (re)load — without this, switching models after one is loaded
+  // silently does nothing.
+  BitNetModelInfo? _loadedModel;
   List<BitNetModelInfo> _compatibleModels = const [];
+  // Which catalog models are already downloaded, keyed by model id. Drives the
+  // "Cached / Needs download" badge in the model picker.
+  Map<String, bool> _cachedStatus = const {};
 
   _LoadState _state = _LoadState.idle;
   double _progress = 0;
@@ -63,6 +71,7 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _profileDevice();
+    _refreshCacheStatus();
   }
 
   Future<void> _profileDevice() async {
@@ -74,16 +83,40 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// Refreshes which catalog models are already downloaded on disk. Called on
+  /// startup and after a load completes (a fresh download may have landed).
+  Future<void> _refreshCacheStatus() async {
+    final status = await ModelCache.cachedStatus(BitNetCatalog.all);
+    if (!mounted) return;
+    setState(() => _cachedStatus = status);
+  }
+
   Future<void> _loadEngine() async {
+    // Tear down any previously loaded model first: its engine owns a native
+    // context + inference isolate that must be released before loading another
+    // (two full models won't fit in RAM, and the old _session would keep
+    // serving the other tabs otherwise).
+    final previous = _session;
     setState(() {
       _state = _LoadState.loading;
       _errorMsg = null;
       _progress = 0;
+      _session = null;
+      _rag = null;
+      _loadedModel = null;
     });
-    final engine = BitNetEngine(model: _selectedModel);
+    await previous?.dispose();
+
+    final target = _selectedModel;
+    final engine = BitNetEngine(model: target);
     try {
-      await engine.load(onProgress: (p) => setState(() => _progress = p));
-      final session = BitNetSession(engine: engine, model: _selectedModel)
+      await engine.load(onProgress: (p) {
+        // The model is ~1 GB; the user can leave this screen mid-download, so
+        // every callback that outlives the widget has to be dropped.
+        if (!mounted) return;
+        setState(() => _progress = p);
+      });
+      final session = BitNetSession(engine: engine, model: target)
         ..setSystemPrompt(
             'You are a helpful, concise assistant running fully on-device.');
       final rag = BitNetRag(
@@ -93,22 +126,37 @@ class _HomePageState extends State<HomePage> {
         ),
       );
       await rag.warmUp();
+      if (!mounted) {
+        // Widget went away while the model was loading — nothing will ever
+        // dispose this session, so release the native context here.
+        await session.dispose();
+        return;
+      }
       setState(() {
         _session = session;
         _rag = rag;
+        _loadedModel = target;
         _state = _LoadState.ready;
       });
-    } on BitNetException catch (e) {
+      // A download may have just completed — reflect it in the picker badges.
+      _refreshCacheStatus();
+    } catch (e) {
+      // Catches everything, not just BitNetException: a MissingPluginException
+      // from the RAM channel or any other stray error used to escape here and
+      // strand the UI on "Loading" with no message and no way to retry.
       await engine.dispose();
+      if (!mounted) return;
       setState(() {
         _state = _LoadState.error;
-        _errorMsg = e.message;
+        _errorMsg = e is BitNetException ? e.message : e.toString();
       });
     }
   }
 
   @override
   void dispose() {
+    // Fire-and-forget: dispose() is synchronous, but the session teardown must
+    // still run so the native context (and its ~1 GB of weights) is freed.
     _session?.dispose();
     super.dispose();
   }
@@ -138,7 +186,9 @@ class _HomePageState extends State<HomePage> {
           _DeviceTab(
             profile: _profile,
             compatibleModels: _compatibleModels,
+            cachedStatus: _cachedStatus,
             selectedModel: _selectedModel,
+            loadedModel: _loadedModel,
             onSelectModel: (m) => setState(() => _selectedModel = m),
             state: _state,
             progress: _progress,
@@ -162,7 +212,11 @@ class _HomePageState extends State<HomePage> {
 class _DeviceTab extends StatelessWidget {
   final DeviceProfile? profile;
   final List<BitNetModelInfo> compatibleModels;
+  /// Downloaded-on-disk status keyed by model id. A missing key is treated as
+  /// not-yet-known (cache scan still in flight).
+  final Map<String, bool> cachedStatus;
   final BitNetModelInfo selectedModel;
+  final BitNetModelInfo? loadedModel;
   final ValueChanged<BitNetModelInfo> onSelectModel;
   final _LoadState state;
   final double progress;
@@ -172,7 +226,9 @@ class _DeviceTab extends StatelessWidget {
   const _DeviceTab({
     required this.profile,
     required this.compatibleModels,
+    required this.cachedStatus,
     required this.selectedModel,
+    required this.loadedModel,
     required this.onSelectModel,
     required this.state,
     required this.progress,
@@ -206,13 +262,24 @@ class _DeviceTab extends StatelessWidget {
         _Card(
           title: 'Available models',
           children: [
+            // A plain ListTile rather than RadioListTile: the latter's
+            // groupValue/onChanged pair is deprecated in favour of a RadioGroup
+            // ancestor, which needs Flutter 3.32 — above this package's
+            // declared ">=3.24.0" floor.
             for (final m in BitNetCatalog.all)
-              RadioListTile<BitNetModelInfo>(
-                value: m,
-                groupValue: selectedModel,
-                onChanged: state == _LoadState.loading
+              ListTile(
+                onTap: state == _LoadState.loading
                     ? null
-                    : (v) => onSelectModel(v!),
+                    : () => onSelectModel(m),
+                enabled: state != _LoadState.loading,
+                leading: Icon(
+                  m == selectedModel
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                  color: m == selectedModel
+                      ? Theme.of(context).colorScheme.primary
+                      : null,
+                ),
                 title: Text(m.displayName),
                 subtitle: Text(
                   '${m.paramsBillion}B • ${m.quantization.name.toUpperCase()} • '
@@ -220,6 +287,7 @@ class _DeviceTab extends StatelessWidget {
                   '• ${compatibleModels.contains(m) ? "compatible" : "needs more RAM"}',
                   style: const TextStyle(fontSize: 12),
                 ),
+                trailing: _CacheBadge(cached: cachedStatus[m.id]),
               ),
           ],
         ),
@@ -256,8 +324,25 @@ class _DeviceTab extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           FilledButton(onPressed: onLoad, child: const Text('Retry')),
-        ] else if (state == _LoadState.ready)
+        ] else if (state == _LoadState.ready && selectedModel == loadedModel)
           const Center(child: Text('Engine ready — switch tabs to use it.'))
+        else if (state == _LoadState.ready)
+          // A different model is selected than the one loaded — offer to switch.
+          Column(
+            children: [
+              Text(
+                '${loadedModel?.displayName ?? "A model"} is loaded. '
+                'Load ${selectedModel.displayName} instead?',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 8),
+              FilledButton(
+                onPressed: canRun ? onLoad : null,
+                child: Text('Switch to ${selectedModel.displayName}'),
+              ),
+            ],
+          )
         else
           FilledButton(
             onPressed: canRun ? onLoad : null,
@@ -280,20 +365,41 @@ class _ChatTab extends StatefulWidget {
   State<_ChatTab> createState() => _ChatTabState();
 }
 
-class _ChatTabState extends State<_ChatTab> {
+class _ChatTabState extends State<_ChatTab>
+    with AutomaticKeepAliveClientMixin {
   final _ctrl = TextEditingController();
   final _scroll = ScrollController();
   final List<({String role, String body})> _ui = [];
-  String _streaming = '';
+
+  /// Live reply text. Held in a [ValueNotifier] rather than in State because a
+  /// `setState` per token rebuilt every bubble in the list — on the same CPU
+  /// that is busy decoding the model.
+  final _streaming = ValueNotifier<String>('');
   StreamSubscription<String>? _sub;
   bool _busy = false;
+
+  /// TabBarView only keeps adjacent pages alive, so without this the whole
+  /// transcript is thrown away as soon as the user visits a non-neighbouring
+  /// tab and comes back.
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void dispose() {
     _sub?.cancel();
     _ctrl.dispose();
     _scroll.dispose();
+    _streaming.dispose();
     super.dispose();
+  }
+
+  /// Keeps the newest text in view while streaming, unless the user has
+  /// scrolled up to read back — then leave their position alone.
+  void _followStream() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    if (pos.maxScrollExtent - pos.pixels > 120) return;
+    pos.jumpTo(pos.maxScrollExtent);
   }
 
   Future<void> _send() async {
@@ -302,38 +408,57 @@ class _ChatTabState extends State<_ChatTab> {
     final msg = _ctrl.text.trim();
     if (msg.isEmpty) return;
     _ctrl.clear();
+    _streaming.value = '';
     setState(() {
       _ui.add((role: 'user', body: msg));
-      _streaming = '';
       _busy = true;
     });
-    _sub = session.chat(msg).listen(
-      (piece) => setState(() => _streaming += piece),
-      onDone: () => setState(() {
-        _ui.add((role: 'assistant', body: _streaming));
-        _streaming = '';
+
+    void finish(String body) {
+      _sub = null;
+      _streaming.value = '';
+      if (!mounted) return;
+      setState(() {
+        _ui.add((role: 'assistant', body: body));
         _busy = false;
-      }),
-      onError: (Object e) => setState(() {
-        _ui.add((role: 'assistant', body: 'Error: $e'));
-        _streaming = '';
-        _busy = false;
-      }),
-    );
+      });
+    }
+
+    try {
+      _sub = session.chat(msg).listen(
+        (piece) {
+          _streaming.value += piece;
+          WidgetsBinding.instance.addPostFrameCallback((_) => _followStream());
+        },
+        onDone: () => finish(_streaming.value),
+        onError: (Object e) => finish('Error: $e'),
+      );
+    } catch (e) {
+      // chat() rejects synchronously when the engine is busy — the Summarise
+      // and Ask tabs drive the same session, so this is reachable without
+      // touching this tab twice.
+      finish('Error: $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
     if (widget.session == null) return const _NotReady();
     return Column(children: [
       Expanded(
         child: ListView.builder(
           controller: _scroll,
           padding: const EdgeInsets.all(12),
-          itemCount: _ui.length + (_streaming.isNotEmpty ? 1 : 0),
+          itemCount: _ui.length + (_busy ? 1 : 0),
           itemBuilder: (ctx, i) {
             if (i == _ui.length) {
-              return _Bubble(role: 'assistant', body: _streaming);
+              // Only this bubble rebuilds per token.
+              return ValueListenableBuilder<String>(
+                valueListenable: _streaming,
+                builder: (_, text, __) =>
+                    _Bubble(role: 'assistant', body: text),
+              );
             }
             return _Bubble(role: _ui[i].role, body: _ui[i].body);
           },
@@ -385,7 +510,8 @@ class _SummariseTab extends StatefulWidget {
   State<_SummariseTab> createState() => _SummariseTabState();
 }
 
-class _SummariseTabState extends State<_SummariseTab> {
+class _SummariseTabState extends State<_SummariseTab>
+    with AutomaticKeepAliveClientMixin {
   final _ctrl = TextEditingController(
     text:
         'BitNet b1.58 is a 1.58-bit quantised LLM architecture from Microsoft. '
@@ -397,25 +523,38 @@ class _SummariseTabState extends State<_SummariseTab> {
   String _output = '';
   bool _busy = false;
 
+  /// See the note on _ChatTabState.wantKeepAlive.
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _run() async {
     final session = widget.session;
-    if (session == null) return;
+    if (session == null || _busy) return;
     setState(() {
       _busy = true;
       _output = '';
     });
     try {
       final out = await session.summarize(_ctrl.text, style: _style);
+      if (!mounted) return;
       setState(() => _output = out);
     } catch (e) {
+      if (!mounted) return;
       setState(() => _output = 'Error: $e');
     } finally {
-      setState(() => _busy = false);
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
     if (widget.session == null) return const _NotReady();
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -480,15 +619,25 @@ class _RagTab extends StatefulWidget {
   State<_RagTab> createState() => _RagTabState();
 }
 
-class _RagTabState extends State<_RagTab> {
+class _RagTabState extends State<_RagTab> with AutomaticKeepAliveClientMixin {
   final _ctrl = TextEditingController(text: 'How big is the BitNet download?');
   String _answer = '';
   List<RetrievedChunk> _citations = const [];
   bool _busy = false;
 
+  /// See the note on _ChatTabState.wantKeepAlive.
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _ask() async {
     final rag = widget.rag;
-    if (rag == null) return;
+    if (rag == null || _busy) return;
     setState(() {
       _busy = true;
       _answer = '';
@@ -496,19 +645,22 @@ class _RagTabState extends State<_RagTab> {
     });
     try {
       final res = await rag.ask(_ctrl.text);
+      if (!mounted) return;
       setState(() {
         _answer = res.answer;
         _citations = res.citations;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() => _answer = 'Error: $e');
     } finally {
-      setState(() => _busy = false);
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
     if (widget.rag == null) return const _NotReady();
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -664,6 +816,36 @@ class _StatusChip extends StatelessWidget {
       side: BorderSide(color: color),
       padding: EdgeInsets.zero,
       visualDensity: VisualDensity.compact,
+    );
+  }
+}
+
+/// Small trailing badge indicating whether a model's GGUF is already on disk.
+/// [cached] null → the cache scan is still running (shows a spinner).
+class _CacheBadge extends StatelessWidget {
+  final bool? cached;
+  const _CacheBadge({required this.cached});
+
+  @override
+  Widget build(BuildContext context) {
+    if (cached == null) {
+      return const SizedBox(
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    }
+    final (label, icon, color) = cached!
+        ? ('Cached', Icons.check_circle, Colors.green)
+        : ('Download', Icons.download, Colors.blueGrey);
+    return Chip(
+      avatar: Icon(icon, size: 16, color: color),
+      label: Text(label, style: const TextStyle(fontSize: 11)),
+      backgroundColor: color.withAlpha(30),
+      side: BorderSide(color: color),
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
     );
   }
 }

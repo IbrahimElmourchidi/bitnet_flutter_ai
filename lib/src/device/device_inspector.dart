@@ -1,7 +1,10 @@
 library;
 
+// dart.library.js_interop (not dart.library.html) — see the note in
+// engine/bitnet_engine.dart: `dart:html` is absent under dart2wasm, so an
+// html-based guard picks the dart:io implementation on wasm web builds.
 import 'device_inspector_impl.dart'
-    if (dart.library.html) 'device_inspector_web.dart';
+    if (dart.library.js_interop) 'device_inspector_web.dart';
 
 /// Compatibility check threshold: 3072 MB.
 const int kMinRamBytes = 3072 * 1024 * 1024;

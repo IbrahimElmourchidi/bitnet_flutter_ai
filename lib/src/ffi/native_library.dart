@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
@@ -45,7 +46,16 @@ class NativeLibrary {
       }
       if (Platform.isMacOS) return DynamicLibrary.open('libprism_bridge.dylib');
       if (Platform.isWindows) return DynamicLibrary.open('prism_bridge.dll');
-      if (Platform.isIOS) return DynamicLibrary.process();
+      if (Platform.isIOS) {
+        // Prism ships as its OWN embedded dynamic framework (not statically
+        // linked into the app), so we open it by path rather than using
+        // DynamicLibrary.process(). This is deliberate: the bitnet backend is
+        // also linked into the process and exports the SAME bn_* names, so
+        // .process() would resolve bitnet's bn_init — which cannot load a Q2_0
+        // GGUF. Opening the framework directly returns prism's own symbols.
+        BitNetLog.log('ffi', 'opening prism_bridge.framework');
+        return DynamicLibrary.open('prism_bridge.framework/prism_bridge');
+      }
       throw BitNetLibraryLoadException(
         'PrismML backend unsupported on ${Platform.operatingSystem}',
       );
@@ -158,12 +168,19 @@ class NativeLibrary {
     });
   }
 
-  /// Runs one auto-regressive step and returns the next token piece.
+  /// Runs one auto-regressive step and returns the raw bytes of the next token
+  /// piece.
   ///
   /// Returns `null` when generation is complete (EOS or context full).
   ///
+  /// The bytes are NOT UTF-8 decoded here. A single piece from the tokenizer is
+  /// often only a *fragment* of a multi-byte UTF-8 character (llama.cpp's
+  /// byte-fallback vocab emits raw bytes), so decoding at the piece boundary
+  /// throws `Unfinished UTF-8 octet sequence`. The caller must accumulate bytes
+  /// across pieces and decode only complete code points (see [Utf8StreamDecoder]).
+  ///
   /// Throws [BitNetInferenceException] on native error.
-  String? nextToken() {
+  Uint8List? nextToken() {
     _requireContext();
     return using((arena) {
       final donePtr = arena<Int32>()..value = 0;
@@ -184,10 +201,15 @@ class NativeLibrary {
         );
       }
 
-      // Read the piece, then immediately free the native string.
-      final piece = tokenPtr.cast<Utf8>().toDartString();
+      // Copy the raw bytes (up to the NUL terminator), then immediately free
+      // the native string. asTypedList is a view over native memory, so we
+      // copy via Uint8List.fromList before bn_free_string invalidates it.
+      final utf8Ptr = tokenPtr.cast<Utf8>();
+      final bytes = Uint8List.fromList(
+        utf8Ptr.cast<Uint8>().asTypedList(utf8Ptr.length),
+      );
       _b.bn_free_string(tokenPtr);
-      return piece;
+      return bytes;
     });
   }
 
@@ -195,17 +217,6 @@ class NativeLibrary {
   int contextSize() {
     if (_ctx == nullptr) return -1;
     return _b.bn_context_size(_ctx);
-  }
-
-  /// Returns a model metadata string by GGUF key, or null if not found.
-  String? meta(String key) {
-    if (_ctx == nullptr) return null;
-    return using((arena) {
-      final keyPtr = key.toNativeUtf8(allocator: arena).cast<Char>();
-      final valPtr = _b.bn_meta(_ctx, keyPtr);
-      if (valPtr == nullptr) return null;
-      return valPtr.cast<Utf8>().toDartString();
-    });
   }
 
   /// Frees the native context. Safe to call multiple times.

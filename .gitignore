@@ -35,4 +35,10 @@ migrate_working_dir/
 # example/web/) are committed — these directories are large, environment-
 # specific, and fully reproducible from the build scripts.
 native/build-*/
+# Fat/merged static libs assembled by the iOS build before they are packaged
+# into ios/Frameworks/*.xcframework.
+native/merged-ios-*/
 **/android/local.properties
+
+# Claude Code local (per-machine) settings.
+.claude/settings.local.json

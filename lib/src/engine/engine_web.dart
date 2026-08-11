@@ -61,6 +61,14 @@ class WebEngine implements BitNetEngine {
   JSAny? _ctx;
   bool _loaded = false;
 
+  /// Set by [cancelGeneration], cleared at the start of each [generate]. The
+  /// loop checks it between worker round-trips.
+  bool _cancelRequested = false;
+
+  /// Guards against two overlapping generations on the one WASM context (see
+  /// [BitNetBusyException]).
+  bool _generating = false;
+
   @override
   bool get isLoaded => _loaded;
 
@@ -144,57 +152,76 @@ class WebEngine implements BitNetEngine {
     bool addBos = true,
   }) async* {
     if (!_loaded || _ctx == null) throw const BitNetNotLoadedException();
+    if (_generating) throw const BitNetBusyException();
 
-    final rc = (await _jsPrompt(_ctx!, prompt.toJS, (addBos ? 1 : 0).toJS).toDart)
-        .toDartInt;
-    if (rc != 0) {
-      throw const BitNetInferenceException(message: 'bn_prompt failed in WASM.');
-    }
-
-    var count = 0;
-    // Detects this model's end-of-turn markers even when split across several
-    // token pieces. Markers are template-specific (see chat_templates.dart).
-    final stopDetector =
-        TurnStopDetector(chatTemplateFor(_model.chatTemplate).stopMarkers);
-    while (maxNewTokens == 0 || count < maxNewTokens) {
-      final result = await _jsNextToken(_ctx!).toDart;
-      final dartResult = result.dartify() as Map<Object?, Object?>?;
-      if (dartResult == null) {
+    _generating = true;
+    _cancelRequested = false;
+    try {
+      final rc =
+          (await _jsPrompt(_ctx!, prompt.toJS, (addBos ? 1 : 0).toJS).toDart)
+              .toDartInt;
+      if (rc != 0) {
         throw const BitNetInferenceException(
-          message: 'bn_next_token returned unexpected null from WASM.',
-        );
+            message: 'bn_prompt failed in WASM.');
       }
 
-      final done = dartResult['done'] as bool? ?? false;
-      if (done) break;
+      var count = 0;
+      // Detects this model's end-of-turn markers even when split across several
+      // token pieces. Markers are template-specific (see chat_templates.dart).
+      final stopDetector =
+          TurnStopDetector(chatTemplateFor(_model.chatTemplate).stopMarkers);
+      while (maxNewTokens == 0 || count < maxNewTokens) {
+        // Cancellation lands here, between worker round-trips.
+        if (_cancelRequested) break;
 
-      final token = dartResult['token'] as String?;
-      if (token != null) {
-        final emit = stopDetector.feed(token);
-        if (emit.isNotEmpty) yield emit;
-        if (stopDetector.stopped) {
-          // A complete end-of-turn marker was assembled — stop without
-          // yielding the marker text itself.
-          break;
+        final result = await _jsNextToken(_ctx!).toDart;
+        final dartResult = result.dartify() as Map<Object?, Object?>?;
+        if (dartResult == null) {
+          throw const BitNetInferenceException(
+            message: 'bn_next_token returned unexpected null from WASM.',
+          );
         }
-        count++;
-      }
-    }
 
-    // Release any text held back pending marker detection (stream ended via
-    // EOS or token cap).
-    if (!stopDetector.stopped) {
-      final rest = stopDetector.flush();
-      if (rest.isNotEmpty) yield rest;
+        final done = dartResult['done'] as bool? ?? false;
+        if (done) break;
+
+        final token = dartResult['token'] as String?;
+        if (token != null) {
+          final emit = stopDetector.feed(token);
+          if (emit.isNotEmpty) yield emit;
+          if (stopDetector.stopped) {
+            // A complete end-of-turn marker was assembled — stop without
+            // yielding the marker text itself.
+            break;
+          }
+          count++;
+        }
+      }
+
+      // Release any text held back pending marker detection (stream ended via
+      // EOS, token cap, or cancellation).
+      if (!stopDetector.stopped) {
+        final rest = stopDetector.flush();
+        if (rest.isNotEmpty) yield rest;
+      }
+    } finally {
+      // Also runs when the consumer cancels the subscription (async* bodies
+      // unwind at the next yield), so the slot never gets stuck occupied.
+      _generating = false;
+      _cancelRequested = false;
     }
   }
 
   @override
   Future<void> cancelGeneration() async {
-    // Generation runs one token per worker round-trip; cancellation takes
-    // effect at the next token boundary when the caller stops pulling the
-    // stream (the async* loop simply stops requesting more tokens). No
-    // explicit interrupt is sent — the worker finishes the current token.
+    // Generation runs one token per worker round-trip. There is no way to
+    // interrupt the worker mid-token, so the flag is picked up at the next
+    // boundary and the loop exits, flushing whatever was held back.
+    //
+    // This must be an explicit flag rather than relying on the consumer to
+    // stop pulling: `summarize` / `assist` drain the stream with `await for`,
+    // so they never stop pulling and a pull-based cancel would never fire.
+    if (_generating) _cancelRequested = true;
   }
 
   @override

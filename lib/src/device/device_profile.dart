@@ -1,8 +1,12 @@
+import 'dart:math' as math;
+
 import 'device_inspector.dart';
 // Swaps dart:io/dart:ffi platform detection for a browser-based one on web, so
 // this file (reachable from the example's Device tab) compiles for the web.
+// dart.library.js_interop (not dart.library.html) — see the note in
+// engine/bitnet_engine.dart: `dart:html` is absent under dart2wasm.
 import 'platform_info_impl.dart'
-    if (dart.library.html) 'platform_info_web.dart';
+    if (dart.library.js_interop) 'platform_info_web.dart';
 import '../model/bitnet_model_info.dart';
 
 /// Snapshot of the current device's hardware capabilities, used to decide
@@ -79,7 +83,7 @@ class DeviceProfile {
     //    sub-linearly; sqrt(cores/ref) is a decent first-order approximation
     //    for memory-bound matvec workloads like ternary BitNet.
     final effectiveCores = cpuCores.clamp(2, 16).toDouble();
-    final coreScale = _sqrt(effectiveCores / refCores);
+    final coreScale = math.sqrt(effectiveCores / refCores);
 
     // 2. Scale inversely with parameter count. BitNet's matvec is roughly
     //    linear in parameters per token at fixed quantisation.
@@ -145,16 +149,6 @@ class DeviceProfile {
 }
 
 enum _Arch { x64, arm64Mobile, arm64Desktop, wasm, unknown }
-
-double _sqrt(double x) {
-  // Newton's method, two iterations — avoids importing dart:math here.
-  if (x <= 0) return 0;
-  var y = x;
-  for (var i = 0; i < 6; i++) {
-    y = 0.5 * (y + x / y);
-  }
-  return y;
-}
 
 double _ramPressureScale(int total, {required int min, required int recommended}) {
   if (total >= recommended) return 1.0;

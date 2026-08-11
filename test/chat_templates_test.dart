@@ -17,13 +17,39 @@ void main() {
       }
     });
 
-    test('bitnetLabeled keeps the verbatim BitNet format', () {
+    test('bitnetLabeled uses Human:/BITNETAssistant: labels, system folded in',
+        () {
       final out = chatTemplateFor(ChatTemplateFamily.bitnetLabeled)
           .format(turns, 'You are helpful.');
-      expect(out, startsWith('<|begin_of_text|>'));
-      expect(out, contains('System: You are helpful.<|eot_id|>'));
-      expect(out, contains('User: hi<|eot_id|>'));
-      expect(out, endsWith('Assistant: '));
+      // No <|begin_of_text|> literal (llama.cpp prepends BOS via addBos). The
+      // system prompt is folded into the first Human turn, and the prompt ends
+      // on an open assistant cue. See _formatBitnetLabeled.
+      expect(out, isNot(contains('<|begin_of_text|>')));
+      expect(out, startsWith('Human: You are helpful.'));
+      expect(out, contains('hi'));
+      expect(out, endsWith('BITNETAssistant: '));
+      // The completed Human turn MUST be closed with <|eot_id|>, not a blank
+      // line — with \n\n the model never emits EOS and rambles into emoji filler
+      // (verified against the real weights). This is the delimiter it was tuned
+      // on. Regression guard for that fix.
+      expect(out, contains('<|eot_id|>BITNETAssistant: '));
+      expect(out, isNot(contains('hi\n\nBITNETAssistant')));
+    });
+
+    test('bitnetLabeled closes every completed turn (multi-turn) with <|eot_id|>',
+        () {
+      final multi = [
+        const ChatTurn(ChatRole.user, 'first'),
+        const ChatTurn(ChatRole.assistant, 'reply one'),
+        const ChatTurn(ChatRole.user, 'second'),
+      ];
+      final out =
+          chatTemplateFor(ChatTemplateFamily.bitnetLabeled).format(multi, null);
+      // Two completed turns (user1, assistant1) + open user2 cue → exactly three
+      // <|eot_id|> delimiters: after "first", after "reply one", after "second".
+      expect('<|eot_id|>'.allMatches(out).length, 3);
+      expect(out, contains('first<|eot_id|>BITNETAssistant: reply one<|eot_id|>'));
+      expect(out, endsWith('second<|eot_id|>BITNETAssistant: '));
     });
 
     test('falconTagged uses <|role|> tags, open <|assistant|> cue, no BOS', () {

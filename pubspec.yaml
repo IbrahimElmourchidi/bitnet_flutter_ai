@@ -41,5 +41,9 @@ flutter:
         pluginClass: BitnetFlutterAiPlugin
       linux:
         ffiPlugin: true
-  assets:
-    - web/coi_service_worker.js
+  # NOTE: web/coi_service_worker.js, bitnet_glue.js and bitnet_worker.js are
+  # deliberately NOT declared as Flutter assets. A package asset resolves to
+  # assets/packages/bitnet_flutter_ai/web/<file>, not the site root, so a service
+  # worker registered from there could never claim the scope index.html needs —
+  # and it would be bundled into every Android/iOS build for nothing. Consumers
+  # copy these into their own web/ directory (see "Web Setup" in README.md).

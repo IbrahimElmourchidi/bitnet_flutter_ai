@@ -1,0 +1,48 @@
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 121f72da..afc16217 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -13258,17 +13258,36 @@ UseGgmlGemm2:;
+         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
+         if (gemm && (ne11 > 3)) {
+             if (src0->type == GGML_TYPE_I2_S) {
+-                float tmp[(src0_end - src0_start)*(ne11 - ne11 % 4)];
++                // Let the gemm kernel accumulate straight into dst instead of a
++                // stack scratch buffer. This used to be
++                //     float tmp[(src0_end - src0_start)*(ne11 - ne11 % 4)];
++                // a VLA whose size scales with the micro-batch: at 1152 weight
++                // rows per thread and a 128-token ubatch that is 576 KB, past the
++                // 512 KB default stack of ggml's worker threads (plain
++                // pthread_create, no attr) on Darwin/iOS. Prefilling a prompt long
++                // enough to fill the ubatch therefore ran off the end of the
++                // thread stack and took SIGBUS in the guard page from inside
++                // ggml_vec_dot_i2_i8_s.
++                //
++                // ggml_gemm_i2_i8_s stores s[col * bs + row] for col in [0, nr)
++                // (activation rows) and row in [0, nc) (this thread's weight
++                // rows), so s = dst + src0_start with bs = the dst row stride
++                // lands on exactly the elements the memcpy below used to copy —
++                // same result, no scratch, no copy, and no dependence on ne11.
++                const int64_t i2s_nrows  = src0_end - src0_start; // weight rows owned by this thread
++                const int64_t i2s_ncols  = ne11 - ne11 % 4;       // activation rows the gemm kernel covers
++                const int64_t dst_stride = nb1 / sizeof(float);   // dst row stride, in floats
+                 const float * scale      = (float * )((uint8_t*) (src0->data) + (ne00 * ne01 / 4));
+                 const float * act_scales = (const float*) ((const char *) src1_wdata + (ne11 * ne10));
+                 const int32_t * act_sums   = (const int32_t*) ((const char *) act_scales + (ne11) * sizeof(float));
+-                gemm(ne00, &tmp[0], src0_end - src0_start, (const char *) src0->data + src0_start * nb01 / 4,
+-                    (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
+-                for (int col = 0; col < ne11 - ne11 % 4; col++) {
+-                    for (int row = 0; row < src0_end - src0_start; row++) {
+-                        tmp[col * (src0_end - src0_start) + row] = (tmp[col * (src0_end - src0_start) + row] - act_sums[col]) / (act_scales[col]) * (*scale);
++                gemm(ne00, (float *)((char *) dst->data) + src0_start, dst_stride,
++                    (const char *) src0->data + src0_start * nb01 / 4,
++                    (const char *) src1_wdata, i2s_ncols, i2s_nrows);
++                for (int64_t col = 0; col < i2s_ncols; col++) {
++                    float * dst_col = (float *)((char *) dst->data + (col * nb1)) + src0_start;
++                    for (int64_t row = 0; row < i2s_nrows; row++) {
++                        dst_col[row] = (dst_col[row] - act_sums[col]) / (act_scales[col]) * (*scale);
+                     }
+-                    memcpy((float *)((char *) dst->data + (col * nb1)) + src0_start, tmp + col * (src0_end - src0_start), (src0_end - src0_start) * sizeof(float));
+                 }
+             }
+             else {

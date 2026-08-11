@@ -1,0 +1,22 @@
+PODS:
+  - bitnet_flutter_ai (0.1.0-beta.1):
+    - Flutter
+  - Flutter (1.0.0)
+
+DEPENDENCIES:
+  - bitnet_flutter_ai (from `.symlinks/plugins/bitnet_flutter_ai/ios`)
+  - Flutter (from `Flutter`)
+
+EXTERNAL SOURCES:
+  bitnet_flutter_ai:
+    :path: ".symlinks/plugins/bitnet_flutter_ai/ios"
+  Flutter:
+    :path: Flutter
+
+SPEC CHECKSUMS:
+  bitnet_flutter_ai: 3b3b697e7ab21e2a27e7bcd560d5b7ad079a0866
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+
+PODFILE CHECKSUM: ca3435f32e2c92ac331d379c3458a4b02d155981
+
+COCOAPODS: 1.16.2

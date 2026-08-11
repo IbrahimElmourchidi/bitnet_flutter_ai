@@ -22,12 +22,6 @@ class ChatTemplateSpec {
   const ChatTemplateSpec({required this.format, required this.stopMarkers});
 }
 
-String _roleWord(ChatRole r) => switch (r) {
-      ChatRole.system => 'System',
-      ChatRole.user => 'User',
-      ChatRole.assistant => 'Assistant',
-    };
-
 String _roleTag(ChatRole r) => switch (r) {
       ChatRole.system => 'system',
       ChatRole.user => 'user',
@@ -35,28 +29,52 @@ String _roleTag(ChatRole r) => switch (r) {
     };
 
 // ---------------------------------------------------------------------------
-// BitNet b1.58 2B-4T — `System: `/`User: `/`Assistant: ` word labels, no
-// separators, `<|eot_id|>` terminators. Kept verbatim from the original
-// BitNetSession._formatChatPrompt (this format is verified working; the model
-// was SFT'd on it and the standard Llama-3 header template is out-of-distn).
-// The leading `<|begin_of_text|>` is intentional — the native bridge sniffs it
-// to suppress a duplicate BOS.
+// BitNet b1.58 2B-4T — `Human: ` / `BITNETAssistant: ` labels, with every
+// COMPLETED turn terminated by the special `<|eot_id|>` token:
+//   {bos}Human: {content}<|eot_id|>BITNETAssistant: {content}<|eot_id|>...
+//
+// CRITICAL — the turn separator must be `<|eot_id|>`, NOT a blank line. Verified
+// empirically against the real 2B-4T weights via a host harness on the shipped
+// GGUF (native EOS/token dump): with `\n\n` separators the model NEVER emits an
+// end-of-turn token — it finishes the answer then rambles indefinitely into
+// hashtag/emoji filler (runs to the token cap). With `<|eot_id|>` separators the
+// model stops cleanly on `<|eot_id|>` after ~15-25 tokens with no filler. Both
+// single-turn and multi-turn conversations were confirmed. This is because the
+// model was fine-tuned with `<|eot_id|>` (id 128009) as the turn delimiter; the
+// blank-line format is out-of-distribution and leaves the turn "open".
+//
+// The system prompt has no dedicated role: it is folded into the first Human
+// turn, separated from the user's message by a blank line (that blank line is
+// WITHIN a turn and is fine — only the turn DELIMITER must be `<|eot_id|>`).
+//
+// No `<|begin_of_text|>` literal: the engine passes addBos=true and the GGUF has
+// add_bos_token=true, so llama.cpp prepends the BOS (128000). Writing one here
+// would double it. `<|eot_id|>` IS written literally because it is a mid-prompt
+// delimiter, not the auto-prepended BOS — llama.cpp tokenizes it as the single
+// special token 128009 (parse_special=true).
 // ---------------------------------------------------------------------------
 String _formatBitnetLabeled(List<ChatTurn> turns, String? systemPrompt) {
-  final buf = StringBuffer('<|begin_of_text|>');
-  if (systemPrompt != null && systemPrompt.trim().isNotEmpty) {
-    buf
-      ..write('System: ')
-      ..write(systemPrompt.trim())
-      ..write('<|eot_id|>');
-  }
+  const eot = '<|eot_id|>';
+  final buf = StringBuffer();
+  final sys = systemPrompt?.trim();
+  var prependedSystem = false;
   for (final t in turns) {
-    buf
-      ..write('${_roleWord(t.role)}: ')
-      ..write(t.content.trim())
-      ..write('<|eot_id|>');
+    switch (t.role) {
+      case ChatRole.system:
+        // Rare (system turns normally come via systemPrompt); treat as Human.
+        buf.write('Human: ${t.content.trim()}$eot');
+      case ChatRole.user:
+        if (!prependedSystem && sys != null && sys.isNotEmpty) {
+          buf.write('Human: $sys\n\n${t.content.trim()}${eot}BITNETAssistant: ');
+          prependedSystem = true;
+        } else {
+          buf.write('Human: ${t.content.trim()}${eot}BITNETAssistant: ');
+        }
+      case ChatRole.assistant:
+        // Prior assistant reply in multi-turn history — close its turn.
+        buf.write('${t.content.trim()}$eot');
+    }
   }
-  buf.write('Assistant: ');
   return buf.toString();
 }
 
@@ -120,7 +138,36 @@ String _formatChatmlQwen3(List<ChatTurn> turns, String? systemPrompt) {
 const Map<ChatTemplateFamily, ChatTemplateSpec> kChatTemplates = {
   ChatTemplateFamily.bitnetLabeled: ChatTemplateSpec(
     format: _formatBitnetLabeled,
-    stopMarkers: ['<|eot_id|>', '<|end_of_text|>'],
+    // Assistant turns SHOULD end at the model's EOS (<|end_of_text|>), enforced
+    // natively via llama_vocab_is_eog. But this GGUF ends turns with <|eot_id|>
+    // while registering only <|end_of_text|> as EOS, so the native stop often
+    // never fires and the model rambles on, FABRICATING the next turn — it
+    // emits openers it saw in pretraining ("User:", "ANSWER:", "Assistant:")
+    // even though we prompt with "Human:"/"BITNETAssistant:". Left unchecked,
+    // that hallucinated tail is committed to history and poisons every later
+    // turn (see BitNetSession._sanitizeReply).
+    //
+    // These markers are the text-level safety net. They are LINE-ANCHORED
+    // (each starts with a newline, except the special tokens and bare "Human:")
+    // so a reply that merely mentions the word "user" mid-sentence is NOT
+    // truncated — only a turn-opener at the start of a fresh line/block stops
+    // generation. Ordered longest-first is unnecessary (TurnStopDetector picks
+    // the earliest match), but grouped by opener for readability.
+    stopMarkers: [
+      // Special / EOS tokens rendered as literal text by token_to_piece.
+      '<|end_of_text|>',
+      '<|eot_id|>',
+      // The correct opener for THIS template.
+      '\n\nHuman:', '\nHuman:', 'Human:',
+      '\n\nBITNETAssistant:', '\nBITNETAssistant:',
+      // Openers the model hallucinates from other chat formats it saw in
+      // pretraining. Line-anchored to avoid false positives.
+      '\n\nUser:', '\nUser:',
+      '\n\nAssistant:', '\nAssistant:',
+      '\n\nANSWER:', '\nANSWER:',
+      '\n\nQuestion:', '\nQuestion:',
+      '\n\nSystem:', '\nSystem:',
+    ],
   ),
   ChatTemplateFamily.falconTagged: ChatTemplateSpec(
     format: _formatFalconTagged,
