@@ -9,8 +9,31 @@ Pre-1.0.0 versions (`0.x.x-beta.y`) may introduce breaking changes between beta 
 
 ## Unreleased
 
+## 0.2.0-beta.1 — 2026-08-11
+
 ### Added
 
+- **iOS support (device + simulator), both backends.** Ships prebuilt
+  `bitnet_bridge.xcframework` (static archive merged with llama/ggml) and
+  `prism_bridge.xcframework` (self-contained dynamic framework) in
+  `ios/Frameworks/`, covering `arm64` device and `arm64`/`x86_64` simulator
+  slices. The two frameworks export the same `bn_*` names over incompatible
+  ggml copies, so they resolve differently at runtime: bitnet through
+  `DynamicLibrary.process()`, prism through `.open(path)`. The plugin moved to
+  the SwiftPM layout (`ios/bitnet_flutter_ai/Sources/`) so CocoaPods and SPM
+  build the same sources, with `Package.swift` added. `bitnet_force_link.m`
+  keeps the vendored static archive's `bn_*` symbols — reached only via FFI
+  `dlsym`, so nothing references them at link time — from being dead-stripped,
+  without resorting to `-force_load` (which breaks clean Xcode builds because
+  the linker path is validated before the Copy-XCFrameworks phase stages it).
+  Verified end-to-end in the simulator with both the bitnet (I2\_S) and prism
+  (Q2\_0) backends.
+- **`ModelCache` model-picker helpers.** Added `isCached`, `hasPartialDownload`,
+  and `cachedStatus` so a model-picker UI can show download state without
+  triggering a load. A `.verified` stamp is written after a successful SHA-256
+  check so later loads skip re-hashing a multi-GB file, hashing now runs on a
+  background isolate instead of the UI thread, and `onProgress` is throttled
+  to 0.5% steps.
 - **Expanded model catalog (10 models).** Added six TII models that ship
   pre-built I2\_S GGUFs and run on the existing bitnet.cpp native stack with no
   rebuild — `Falcon3-{1B,3B,7B,10B}-Instruct-1.58bit` and
@@ -113,9 +136,28 @@ Pre-1.0.0 versions (`0.x.x-beta.y`) may introduce breaking changes between beta 
   the canonical `lib` prefix (`libbitnet_bridge.so/.dylib`) so it matches
   what `DynamicLibrary.open` expects. The `PREFIX ""` strip is now
   Windows-only.
+- **pubspec no longer declares the web/ JS files as Flutter assets.** A
+  package asset resolves under `assets/packages/...`, which can never claim
+  the service-worker scope `index.html` needs, and it would otherwise be
+  bundled into every Android/iOS build for nothing. See "Web Setup" in the
+  README for the copy-into-your-own-`web/`-directory workflow.
 
 ### Fixed
 
+- **Degenerate logits on arm64 (NaN/garbage output, iOS device + Android
+  arm64-v8a).** The classic tree's scalar `ggml_vec_dot_i2_i8_s` block layout
+  was wrong, and its buggy `ggml-cpu-i2s.c` GEMM/GEMV fast path was reachable
+  on arm64, which has no AVX2. Patch `0002-i2s-arm-scalar-and-fastpath-gate`
+  fixes the scalar layout and gates that fast path to AVX2/AVX512 only; the
+  x86_64 ABI already used the verified AVX2 kernels either way. Applied by
+  `tool/build_android.sh`.
+- **Prefill SIGBUS/SIGSEGV past ~130 tokens (classic-tree I2\_S gemm).** The
+  prefill path sized a stack VLA as `rows-per-thread * n_ubatch` floats, but
+  ggml worker threads only get the pthread default stack (1 MB on Android,
+  512 KB on Darwin) — a prompt long enough to fill the micro-batch overran it
+  and crashed inside `ggml_vec_dot_i2_i8_s`. Patch
+  `0003-i2s-gemm-no-stack-vla` accumulates straight into `dst` instead, so
+  prefill stack use no longer scales with the prompt.
 - **Runaway `!` output on Android (and any non-AVX2 target).** The BitNet
   I2\_S matmul kernels in bitnet.cpp shipped only AVX2 and NEON
   implementations with no fallback, so on the Android x86_64 emulator (NDK

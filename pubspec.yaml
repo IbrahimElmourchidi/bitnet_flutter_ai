@@ -1,6 +1,6 @@
 name: bitnet_flutter_ai
 description: Run Microsoft BitNet b1.58 2B-4T locally on Android, iOS, desktop, and Web (WASM).
-version: 0.1.0-beta.1
+version: 0.2.0-beta.1
 homepage: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai
 repository: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai
 issue_tracker: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai/issues

@@ -1,0 +1,2 @@
+export ANDROID_NDK=$HOME/Android/Sdk/ndk/28.2.13676358
+export PRISM_LLAMA_CPP=/media/hema/work/Utanium/packages/prism-ml-llama.cpp-prism ./build_android_prism.sh

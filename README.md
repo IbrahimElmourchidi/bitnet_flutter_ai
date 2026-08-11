@@ -1,16 +1,16 @@
 # bitnet\_flutter\_ai
 
-> **Beta — `0.1.0-beta.1`.**  
-> The public API is stable in shape but may change before `1.0.0`. Native binary distribution and the Web WASM artefact are not yet published to pub.dev — see [Building Native Libraries](#building-native-libraries) below.
+> **Beta — `0.2.0-beta.1`.**  
+> The public API is stable in shape but may change before `1.0.0`. The Web WASM artefact is not yet published to pub.dev — see [Building Native Libraries](#building-native-libraries) below.
 
-Run Microsoft's [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) large language model **fully on-device** — no server, no API key.
+Run Microsoft's [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) — and nine other ternary/1-bit models from TII and PrismML — **fully on-device**, no server, no API key. See [Model catalog](#model-catalog).
 
 | Platform | Status |
 |---|---|
 | Android (arm64-v8a / x86\_64) | Working — prebuilt `.so` shipped in `jniLibs/` |
+| iOS (arm64 device + simulator) | Working — prebuilt `.xcframework` shipped in `ios/Frameworks/`; verified in the simulator |
 | Linux (x86\_64) | Working — verified end-to-end |
-| Web (desktop Chrome / Firefox) | Working — build with `tool/build_web.sh` (single-threaded, ~1–2 tok/s; desktop only) |
-| iOS (arm64) | Planned — native build required |
+| Web (desktop Chrome / Firefox) | Working — build with `tool/build_web.sh` (single-threaded, ~1–2 tok/s; desktop only; bitnet.cpp backend only) |
 | macOS (arm64 / x86\_64) | Planned — native build required |
 | Windows (x86\_64) | Planned — native build required |
 
@@ -52,7 +52,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  bitnet_flutter_ai: ^0.1.0-beta.1
+  bitnet_flutter_ai: ^0.2.0-beta.1
 ```
 
 Then run:
@@ -388,8 +388,19 @@ The output `libbitnet_bridge.so` must be placed in
 
 ### iOS
 
-Use Xcode to build a static library (`libbitnet_bridge.a`) and add it as a
-`FRAMEWORK_SEARCH_PATHS` entry, or use the CocoaPods vendored\_libraries approach.
+Prebuilt `.xcframework`s already ship in `ios/Frameworks/` (device `arm64` +
+simulator `arm64`/`x86_64`) and are wired up via `vendored_frameworks` in the
+podspec — no build step needed to consume the package. `bitnet_bridge.xcframework`
+is a static archive merged with llama/ggml, resolved at runtime through
+`DynamicLibrary.process()`; `prism_bridge.xcframework` is a self-contained
+dynamic framework, resolved through `DynamicLibrary.open(path)`. Rebuild them
+only if you're changing the native bridge itself (Xcode + cmake + ninja +
+libtool/lipo required):
+
+```bash
+BITNET_CPP=../bitnet.cpp ./tool/build_ios.sh              # bitnet_bridge.xcframework
+PRISM_LLAMA_CPP=../prism-llama.cpp ./tool/build_ios_prism.sh  # prism_bridge.xcframework
+```
 
 ### Web (WASM)
 
@@ -412,18 +423,23 @@ the two `<script>` tags from [Web Setup](#web-setup).
 ### PrismML (Ternary Bonsai) backend
 
 Only needed if you use a `Ternary-Bonsai-*` model. It builds a **separate**
-self-contained `libprism_bridge.so` from PrismML's llama.cpp fork (a different
-ggml ABI than bitnet.cpp — the two libraries never share symbols).
+self-contained library from PrismML's llama.cpp fork (a different ggml ABI
+than bitnet.cpp — the two libraries never share symbols). Android and iOS
+prebuilts already ship in `jniLibs/` and `ios/Frameworks/` respectively —
+only rebuild if you're changing the bridge itself.
 
 ```bash
 git clone --branch prism https://github.com/PrismML-Eng/llama.cpp.git ../prism-llama.cpp
-./tool/build_linux_prism.sh                                   # Linux desktop / host tests
+./tool/build_linux_prism.sh                                             # Linux desktop / host tests
 ANDROID_NDK=$HOME/Android/Sdk/ndk/<ver> ./tool/build_android_prism.sh   # arm64-v8a + x86_64
+./tool/build_ios_prism.sh                                               # prism_bridge.xcframework
 ```
 
-Both scripts drive `native/prism/CMakeLists.txt`, which links the fork static
-and version-scripts the output down to just the `bn_*` C ABI. The Android
-script drops `libprism_bridge.so` into `jniLibs/<abi>/`. No web build yet.
+All three scripts drive `native/prism/CMakeLists.txt`, which links the fork
+static and version-scripts the output down to just the `bn_*` C ABI. The
+Android script drops `libprism_bridge.so` into `jniLibs/<abi>/`; the iOS
+script produces `prism_bridge.xcframework` in `ios/Frameworks/`. No web build
+yet.
 
 ---
 
@@ -454,16 +470,20 @@ DeviceInspector            — platform RAM detection (fail-closed gate)
 
 ## Beta Limitations
 
-- Prebuilt libraries ship for Android (`arm64-v8a`, `x86_64`) only. iOS, macOS,
-  and Windows still require building the bridge from source; web is built with
-  `tool/build_web.sh`. Nothing is distributed via pub.dev yet.
+- Prebuilt libraries ship for Android (`arm64-v8a`, `x86_64`) and iOS (device
+  `arm64` + simulator). macOS and Windows still require building the bridge
+  from source; web is built with `tool/build_web.sh`. Nothing is distributed
+  via pub.dev yet.
+- iOS is verified in the **simulator only** — not yet run on a physical device.
+- The PrismML (`Ternary-Bonsai-*`, Q2\_0) backend is **native-only**: Android
+  and iOS, no Web build of the fork yet.
 - Web is **desktop-browser only** and **single-threaded scalar** (~1–2 tok/s for
   the 2B model). The ~1.1 GB model lives in the WASM heap during inference, so a
   tab needs multi-GB of memory — mobile browsers will OOM. Threading and a
   `wasm_simd128` kernel are the planned speed follow-ups.
 - `cancelGeneration()` on Web cancels only at `yield` boundaries — there is no
   signal to interrupt the synchronous WASM decode call mid-token.
-- iOS, macOS, and Windows are untested in this beta.
+- macOS and Windows are untested in this beta.
 - No sampling parameter control yet (temperature, top-p). Greedy sampling is used.
 - The model is not instruction-tuned by default; wrap your prompt in the appropriate chat template for best results.
 
