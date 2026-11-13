@@ -49,7 +49,8 @@ final class BitNetInitException extends BitNetException {
       '${nativeError != null ? ' (native: $nativeError)' : ''}';
 }
 
-/// A native inference call (bn_prompt or bn_next_token) returned an error.
+/// A native inference call (bn_prompt, bn_next_token, bn_set_sampling)
+/// returned an error.
 final class BitNetInferenceException extends BitNetException {
   /// Error string from the native layer, if available.
   final String? nativeError;
@@ -89,26 +90,38 @@ final class BitNetDownloadException extends BitNetException {
       '${httpStatusCode != null ? ' (HTTP $httpStatusCode)' : ''}';
 }
 
-/// [BitNetEngine.generate] was called before [BitNetEngine.load].
+/// A generation was requested before `BitNetEngine.load()` completed (or after
+/// `dispose()`).
 final class BitNetNotLoadedException extends BitNetException {
   const BitNetNotLoadedException()
-      : super('BitNetEngine.load() must be called and awaited before generate().');
+      : super('BitNetEngine.load() must complete before generating.');
 }
 
-/// The inference isolate exited unexpectedly.
+/// The inference isolate exited unexpectedly (e.g. a native crash surfaced as
+/// an isolate error). The engine is unloaded; call `load()` again.
 final class BitNetIsolateException extends BitNetException {
   const BitNetIsolateException(super.message);
 }
 
-/// [BitNetEngine.generate] was called while another generation is still in
-/// flight on the same engine.
-///
-/// A single engine owns ONE native context; two overlapping generations would
-/// interleave `bn_prompt` / `bn_next_token` calls on it and split one decode
-/// stream between two consumers, corrupting both. Await or cancel the active
-/// stream (`BitNetSession.stop()`) before starting the next one.
-final class BitNetBusyException extends BitNetException {
-  const BitNetBusyException()
-      : super('A generation is already in progress on this engine. Await or '
-            'cancel it before calling generate() again.');
+/// The prompt does not fit in the model's context window (with room left to
+/// generate). `BitNetSession.chat` trims old turns automatically and only
+/// raises this when the newest message alone is too long.
+final class BitNetPromptTooLongException extends BitNetException {
+  const BitNetPromptTooLongException(super.message);
+
+  @override
+  String toString() => 'BitNetPromptTooLongException: $message';
+}
+
+/// `BitNetSession.extract` could not turn the model output into the requested
+/// JSON shape (only possible when generation was cut short, e.g. by
+/// `maxNewTokens` or cancellation — the grammar otherwise guarantees it).
+final class BitNetExtractionException extends BitNetException {
+  /// The raw model output.
+  final String raw;
+
+  const BitNetExtractionException(super.message, {required this.raw});
+
+  @override
+  String toString() => 'BitNetExtractionException: $message (raw: $raw)';
 }

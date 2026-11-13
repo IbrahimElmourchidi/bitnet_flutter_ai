@@ -1,5 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- bitnet_flutter_ai plugin manifest.
          The plugin does not declare its own permissions or components.
-         RAM detection is done via ActivityManager, which requires no permission. -->
+         Device queries (ActivityManager, PowerManager) go through JNIgen
+         bindings and need no permission. -->
 </manifest>

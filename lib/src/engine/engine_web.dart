@@ -6,6 +6,7 @@ import '../exceptions/bitnet_exception.dart';
 import '../model/bitnet_model_info.dart';
 import '../session/chat_templates.dart';
 import 'bitnet_engine.dart';
+import 'generation_options.dart';
 
 // ---------------------------------------------------------------------------
 // JS interop — `window.BitNetWasm` is a proxy (bitnet_glue.js) over a Web
@@ -18,11 +19,45 @@ import 'bitnet_engine.dart';
 external JSPromise<JSAny?> _jsInit(
     JSString modelPath, JSNumber nCtx, JSNumber nThreads);
 
+/// `{ok, error}` from bn_set_sampling.
+extension type _OkResult._(JSObject _) implements JSObject {
+  external bool get ok;
+  external String? get error;
+}
+
+/// `{rc, error}` from bn_prompt.
+extension type _PromptResult._(JSObject _) implements JSObject {
+  external int get rc;
+  external String? get error;
+}
+
+/// `{done, bytes, logprob, error}` from bn_next_token.
+extension type _NextResult._(JSObject _) implements JSObject {
+  external bool get done;
+  external JSUint8Array? get bytes;
+  external double get logprob;
+  external String? get error;
+}
+
+@JS('BitNetWasm.bn_set_sampling')
+external JSPromise<_OkResult> _jsSetSampling(
+    JSAny ctx,
+    JSNumber temperature,
+    JSNumber topK,
+    JSNumber topP,
+    JSNumber repeatPenalty,
+    JSNumber repeatLastN,
+    JSNumber seed,
+    JSString grammar);
+
 @JS('BitNetWasm.bn_prompt')
-external JSPromise<JSNumber> _jsPrompt(JSAny ctx, JSString prompt, JSNumber addBos);
+external JSPromise<_PromptResult> _jsPrompt(JSAny ctx, JSString prompt, JSNumber addBos);
 
 @JS('BitNetWasm.bn_next_token')
-external JSPromise<JSObject> _jsNextToken(JSAny ctx);
+external JSPromise<_NextResult> _jsNextToken(JSAny ctx);
+
+@JS('BitNetWasm.bn_token_count')
+external JSPromise<JSNumber> _jsTokenCount(JSAny ctx, JSString text, JSNumber addBos);
 
 @JS('BitNetWasm.bn_free')
 external JSPromise<JSAny?> _jsFree(JSAny ctx);
@@ -52,36 +87,43 @@ external JSPromise<JSAny?>? get _bitNetWasmReady;
 /// Worker (`bitnet_worker.js`) that owns the WASM module and defines the async
 /// `window.BitNetWasm` proxy. Running in the worker keeps model loading and
 /// token generation off the UI thread. The module is single-threaded, so no
-/// `SharedArrayBuffer` / cross-origin isolation is required.
+/// `SharedArrayBuffer` / cross-origin isolation is required — which also means
+/// there is no shared memory to cancel a running prefill through: on web,
+/// cancellation takes effect at the next token boundary.
 class WebEngine implements BitNetEngine {
-  final BitNetModelInfo _model;
+  @override
+  final BitNetModelInfo model;
 
-  WebEngine(this._model);
+  WebEngine(this.model);
 
   JSAny? _ctx;
   bool _loaded = false;
+  Future<void>? _loading;
+  GenerationOptions? _sampler;
 
-  /// Set by [cancelGeneration], cleared at the start of each [generate]. The
-  /// loop checks it between worker round-trips.
-  bool _cancelRequested = false;
+  /// Generations run one at a time, in call order (see [BitNetEngine]).
+  Future<void> _tail = Future<void>.value();
 
-  /// Guards against two overlapping generations on the one WASM context (see
-  /// [BitNetBusyException]).
-  bool _generating = false;
+  /// The running generation's cancel switch, checked between tokens.
+  _WebRun? _active;
 
   @override
   bool get isLoaded => _loaded;
 
   @override
-  Future<void> load({void Function(double progress)? onProgress}) async {
-    if (_loaded) return;
+  Future<void> load({void Function(double progress)? onProgress}) {
+    if (_loaded) return Future<void>.value();
+    return _loading ??= _load(onProgress).whenComplete(() => _loading = null);
+  }
+
+  Future<void> _load(void Function(double progress)? onProgress) async {
 
     // Web ships only the bitnet.cpp WASM module. The PrismML (Q2_0) backend has
     // no WASM build yet — fail clearly rather than trying to load a model its
     // stack can't handle.
-    if (_model.engineBackend != EngineBackend.bitnetCpp) {
+    if (model.engineBackend != EngineBackend.bitnetCpp) {
       throw BitNetUnsupportedPlatformException(
-        '${_model.displayName} uses the ${_model.engineBackend.name} backend, '
+        '${model.displayName} uses the ${model.engineBackend.name} backend, '
         'which is not yet supported on web (native platforms only).',
       );
     }
@@ -100,26 +142,26 @@ class WebEngine implements BitNetEngine {
     // 2. Device check — gate on the selected model's RAM floor (see the native
     //    engine for rationale). navigator.deviceMemory is coarse on web.
     final ram = await DeviceInspector.instance.totalPhysicalRamBytes();
-    if (ram < _model.minimumRamBytes) {
+    if (ram < model.minimumRamBytes) {
       throw BitNetUnsupportedDeviceException(
         ram,
-        requiredRamBytes: _model.minimumRamBytes,
-        modelName: _model.displayName,
+        requiredRamBytes: model.minimumRamBytes,
+        modelName: model.displayName,
       );
     }
 
     // 3. Download the GGUF (Cache-API persisted) and stream it into the
     //    module's in-memory filesystem. dart:io / path_provider don't exist on
     //    web, so the JS glue owns the download + FS write; we just await it.
-    final fsPath = '/models/${_model.ggufFileName}';
+    final fsPath = '/models/${model.ggufFileName}';
     final progressShim = ((JSNumber fraction) {
       if (onProgress != null) onProgress(fraction.toDartDouble);
     }).toJS;
     try {
       await _jsProvisionModel(
-        _model.ggufDownloadUrl.toJS,
+        model.ggufDownloadUrl.toJS,
         fsPath.toJS,
-        _model.ggufSizeBytes.toJS,
+        model.ggufSizeBytes.toJS,
         progressShim,
       ).toDart;
     } catch (e) {
@@ -131,7 +173,7 @@ class WebEngine implements BitNetEngine {
     //    the shipped module is built without pthreads.
     final ctx = await _jsInit(
       fsPath.toJS,
-      _model.contextLength.toJS,
+      model.contextLength.toJS,
       1.toJS,
     ).toDart;
 
@@ -146,92 +188,140 @@ class WebEngine implements BitNetEngine {
   }
 
   @override
-  Stream<String> generate(
+  Stream<TokenEvent> generateTokens(
     String prompt, {
-    int maxNewTokens = 512,
-    bool addBos = true,
-  }) async* {
+    GenerationOptions options = const GenerationOptions(),
+  }) {
     if (!_loaded || _ctx == null) throw const BitNetNotLoadedException();
-    if (_generating) throw const BitNetBusyException();
-
-    _generating = true;
-    _cancelRequested = false;
-    try {
-      final rc =
-          (await _jsPrompt(_ctx!, prompt.toJS, (addBos ? 1 : 0).toJS).toDart)
-              .toDartInt;
-      if (rc != 0) {
-        throw const BitNetInferenceException(
-            message: 'bn_prompt failed in WASM.');
+    final run = _WebRun();
+    final controller = StreamController<TokenEvent>(
+      onCancel: () => run.cancelled = true,
+    );
+    _tail = _tail.then((_) async {
+      if (run.cancelled) {
+        await controller.close();
+        return;
       }
-
-      var count = 0;
-      // Detects this model's end-of-turn markers even when split across several
-      // token pieces. Markers are template-specific (see chat_templates.dart).
-      final stopDetector =
-          TurnStopDetector(chatTemplateFor(_model.chatTemplate).stopMarkers);
-      while (maxNewTokens == 0 || count < maxNewTokens) {
-        // Cancellation lands here, between worker round-trips.
-        if (_cancelRequested) break;
-
-        final result = await _jsNextToken(_ctx!).toDart;
-        final dartResult = result.dartify() as Map<Object?, Object?>?;
-        if (dartResult == null) {
-          throw const BitNetInferenceException(
-            message: 'bn_next_token returned unexpected null from WASM.',
-          );
+      _active = run;
+      try {
+        await _generate(prompt, options, run, controller);
+      } on BitNetException catch (e) {
+        if (!run.cancelled) controller.addError(e);
+      } catch (e) {
+        if (!run.cancelled) {
+          controller.addError(BitNetInferenceException(message: e.toString()));
         }
-
-        final done = dartResult['done'] as bool? ?? false;
-        if (done) break;
-
-        final token = dartResult['token'] as String?;
-        if (token != null) {
-          final emit = stopDetector.feed(token);
-          if (emit.isNotEmpty) yield emit;
-          if (stopDetector.stopped) {
-            // A complete end-of-turn marker was assembled — stop without
-            // yielding the marker text itself.
-            break;
-          }
-          count++;
-        }
+      } finally {
+        if (identical(_active, run)) _active = null;
+        await controller.close();
       }
+    });
+    return controller.stream;
+  }
 
-      // Release any text held back pending marker detection (stream ended via
-      // EOS, token cap, or cancellation).
-      if (!stopDetector.stopped) {
-        final rest = stopDetector.flush();
-        if (rest.isNotEmpty) yield rest;
+  Future<void> _generate(String prompt, GenerationOptions o, _WebRun run,
+      StreamController<TokenEvent> out) async {
+    final ctx = _ctx;
+    if (!_loaded || ctx == null) throw const BitNetNotLoadedException();
+
+    if (_sampler == null || !_sampler!.samplerEquals(o)) {
+      _sampler = null;
+      final r = await _jsSetSampling(
+        ctx,
+        o.temperature.toJS,
+        o.topK.toJS,
+        o.topP.toJS,
+        o.repeatPenalty.toJS,
+        o.repeatLastN.toJS,
+        (o.seed & 0xFFFFFFFF).toJS,
+        (o.grammar ?? '').toJS,
+      ).toDart;
+      if (!r.ok) {
+        throw BitNetInferenceException(
+            message: 'bn_set_sampling failed', nativeError: r.error);
       }
-    } finally {
-      // Also runs when the consumer cancels the subscription (async* bodies
-      // unwind at the next yield), so the slot never gets stuck occupied.
-      _generating = false;
-      _cancelRequested = false;
+      _sampler = o;
     }
+
+    final p = await _jsPrompt(ctx, prompt.toJS, (o.addBos ? 1 : 0).toJS).toDart;
+    if (p.rc != 0) {
+      final err = p.error;
+      if (err != null && err.startsWith('prompt_too_long:')) {
+        throw BitNetPromptTooLongException(
+            err.substring('prompt_too_long:'.length).trim());
+      }
+      throw BitNetInferenceException(message: 'bn_prompt failed', nativeError: err);
+    }
+
+    final utf8 = Utf8StreamDecoder();
+    final stop = TurnStopDetector([
+      ...chatTemplateFor(model.chatTemplate).stopMarkers,
+      ...o.stop,
+    ]);
+    var pendingLp = <double>[];
+    void emit(String text) {
+      if (text.isEmpty || run.cancelled) return;
+      out.add(TokenEvent(text, pendingLp));
+      pendingLp = <double>[];
+    }
+
+    var count = 0;
+    while (o.maxNewTokens == 0 || count < o.maxNewTokens) {
+      if (run.cancelled || _ctx == null) break;
+      final r = await _jsNextToken(ctx).toDart;
+      final bytes = r.bytes;
+      if (bytes == null) {
+        if (r.done) break;
+        throw BitNetInferenceException(
+            message: 'bn_next_token failed', nativeError: r.error);
+      }
+      count++;
+      pendingLp.add(r.logprob);
+      final text = utf8.add(bytes.toDart);
+      if (text.isEmpty) continue;
+      emit(stop.feed(text));
+      if (stop.stopped) break;
+    }
+    if (!stop.stopped) {
+      final tail = utf8.flush();
+      if (tail.isNotEmpty) emit(stop.feed(tail));
+      if (!stop.stopped) emit(stop.flush());
+    }
+  }
+
+  @override
+  Future<int> countTokens(String text, {bool addBos = false}) async {
+    final ctx = _ctx;
+    if (!_loaded || ctx == null) throw const BitNetNotLoadedException();
+    final n = (await _jsTokenCount(ctx, text.toJS, (addBos ? 1 : 0).toJS).toDart)
+        .toDartInt;
+    if (n < 0) {
+      throw const BitNetInferenceException(message: 'bn_token_count failed');
+    }
+    return n;
   }
 
   @override
   Future<void> cancelGeneration() async {
-    // Generation runs one token per worker round-trip. There is no way to
-    // interrupt the worker mid-token, so the flag is picked up at the next
-    // boundary and the loop exits, flushing whatever was held back.
-    //
-    // This must be an explicit flag rather than relying on the consumer to
-    // stop pulling: `summarize` / `assist` drain the stream with `await for`,
-    // so they never stop pulling and a pull-based cancel would never fire.
-    if (_generating) _cancelRequested = true;
+    _active?.cancelled = true;
   }
 
   @override
   Future<void> dispose() async {
-    if (_ctx != null) {
-      await _jsFree(_ctx!).toDart;
-      _ctx = null;
-    }
     _loaded = false;
+    _active?.cancelled = true;
+    // Let the running generation reach its next token boundary before the
+    // context it is using is freed.
+    await _tail;
+    final ctx = _ctx;
+    _ctx = null;
+    _sampler = null;
+    if (ctx != null) await _jsFree(ctx).toDart;
   }
+}
+
+class _WebRun {
+  bool cancelled = false;
 }
 
 /// Factory function resolved by the conditional import in [bitnet_engine.dart].

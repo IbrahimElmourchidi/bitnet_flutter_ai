@@ -148,9 +148,8 @@ const Map<ChatTemplateFamily, ChatTemplateSpec> kChatTemplates = {
     // turn (see BitNetSession._sanitizeReply).
     //
     // These markers are the text-level safety net. They are LINE-ANCHORED
-    // (each starts with a newline, except the special tokens and bare "Human:")
-    // so a reply that merely mentions the word "user" mid-sentence is NOT
-    // truncated — only a turn-opener at the start of a fresh line/block stops
+    // (each starts with a newline, except the special tokens) so a reply that
+    // merely mentions "user" or "Human:" mid-sentence is NOT truncated — only a turn-opener at the start of a fresh line/block stops
     // generation. Ordered longest-first is unnecessary (TurnStopDetector picks
     // the earliest match), but grouped by opener for readability.
     stopMarkers: [
@@ -158,7 +157,7 @@ const Map<ChatTemplateFamily, ChatTemplateSpec> kChatTemplates = {
       '<|end_of_text|>',
       '<|eot_id|>',
       // The correct opener for THIS template.
-      '\n\nHuman:', '\nHuman:', 'Human:',
+      '\n\nHuman:', '\nHuman:',
       '\n\nBITNETAssistant:', '\nBITNETAssistant:',
       // Openers the model hallucinates from other chat formats it saw in
       // pretraining. Line-anchored to avoid false positives.

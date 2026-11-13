@@ -31,10 +31,17 @@ functions:
     - 'bn_next_token'
     - 'bn_context_size'
     - 'bn_meta'
+    - 'bn_abi_version'
+    - 'bn_set_sampling'
+    - 'bn_next_token_ex'
+    - 'bn_token_count'
+    - 'bn_set_abort_flag'
+    - 'bn_last_prompt_reused'
 
 structs:
   include:
     - 'BnContext'
+    - 'BnSamplingParams'
 
 # Suppress generation of typedefs and enums from system includes.
 typedefs:
@@ -42,6 +49,12 @@ typedefs:
     - '.*'
 
 enums:
+  exclude:
+    - '.*'
+
+# Constants (BN_ABI_VERSION, BN_ABORTED) are mirrored by hand in
+# lib/src/ffi/native_library.dart.
+macros:
   exclude:
     - '.*'
 

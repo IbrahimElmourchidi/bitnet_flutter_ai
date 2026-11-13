@@ -10,7 +10,9 @@ import 'dart:typed_data';
 import 'engine_native.dart'
     if (dart.library.js_interop) 'engine_web.dart';
 
+import '../exceptions/bitnet_exception.dart';
 import '../model/bitnet_model_info.dart';
+import 'generation_options.dart';
 
 /// Marker strings that signal the end of an assistant turn for BitNet's chat
 /// template. The native layer renders special tokens as literal text
@@ -199,45 +201,75 @@ class Utf8StreamDecoder {
   }
 }
 
-/// The public interface for driving BitNet inference.
+/// On-device LLM inference for one model.
 ///
-/// Usage:
 /// ```dart
-/// final engine = BitNetEngine();
-/// await engine.load(onProgress: (p) => print('${(p*100).toInt()}%'));
-/// await for (final token in engine.generate('Hello')) {
-///   stdout.write(token);
+/// final engine = BitNetEngine(model: BitNetCatalog.defaultModel);
+/// await engine.load(onProgress: (p) => print('${(p * 100).toInt()}%'));
+/// await for (final text in engine.generate('Hello')) {
+///   stdout.write(text);
 /// }
 /// await engine.dispose();
 /// ```
+///
+/// Most apps talk to a `BitNetSession` (chat history, prompt templates,
+/// structured extraction) rather than to the engine directly.
+///
+/// One engine owns one native context. Generations are executed one at a
+/// time, in call order: starting a new one while another is running queues it
+/// behind the first (it never interleaves with it).
 abstract interface class BitNetEngine {
-  /// Downloads (if needed), verifies, and loads [model] into memory.
-  ///
-  /// [onProgress] receives values in [0.0, 1.0] during the download phase.
-  /// Throws [BitNetUnsupportedDeviceException] if RAM < 3072 MB.
-  /// Throws [BitNetInitException] if the native context cannot be created.
-  Future<void> load({void Function(double progress)? onProgress});
-
-  /// Whether the engine has been successfully loaded and is ready to generate.
-  bool get isLoaded;
-
-  /// Streams token pieces for [prompt] until EOS or [maxNewTokens] is reached.
-  ///
-  /// Throws [BitNetNotLoadedException] if called before [load].
-  Stream<String> generate(
-    String prompt, {
-    int maxNewTokens = 512,
-    bool addBos = true,
-  });
-
-  /// Signals the current generation to stop at the next token boundary.
-  Future<void> cancelGeneration();
-
-  /// Frees native resources and kills the inference isolate / WASM context.
-  Future<void> dispose();
-
-  /// Creates an engine for [model] using the correct implementation for the
-  /// current platform (native isolate or WASM).
+  /// Creates an engine for [model] using the implementation for the current
+  /// platform (native isolate or WASM worker).
   factory BitNetEngine({BitNetModelInfo model = BitNetCatalog.defaultModel}) =>
       createEngine(model: model);
+
+  /// The model this engine runs. Sessions read their chat template from it.
+  BitNetModelInfo get model;
+
+  /// Whether [load] has completed and the engine can generate.
+  bool get isLoaded;
+
+  /// Downloads (if needed), verifies, and loads [model] into memory.
+  ///
+  /// Concurrent calls share one load. [onProgress] receives values in
+  /// [0.0, 1.0] during the download phase.
+  ///
+  /// Throws [BitNetUnsupportedDeviceException] when the device has less RAM
+  /// than `model.minimumRamBytes`, and [BitNetInitException] if the native
+  /// context cannot be created.
+  Future<void> load({void Function(double progress)? onProgress});
+
+  /// Streams the completion of [prompt] (an already-templated prompt string)
+  /// together with per-token log-probabilities.
+  ///
+  /// The stream ends at end-of-turn, a stop string, `options.maxNewTokens`,
+  /// or [cancelGeneration]. Cancelling the subscription stops the model too.
+  ///
+  /// Throws [BitNetNotLoadedException] if called before [load].
+  Stream<TokenEvent> generateTokens(
+    String prompt, {
+    GenerationOptions options = const GenerationOptions(),
+  });
+
+  /// Number of tokens [text] occupies in this model's context window.
+  Future<int> countTokens(String text, {bool addBos = false});
+
+  /// Stops the running generation as soon as possible (mid-prefill on
+  /// native). Its stream completes normally with the text produced so far.
+  /// Queued generations are not affected. No-op when idle.
+  Future<void> cancelGeneration();
+
+  /// Frees the model and the inference isolate / WASM context.
+  Future<void> dispose();
+}
+
+/// Text-only convenience over [BitNetEngine.generateTokens].
+extension BitNetEngineText on BitNetEngine {
+  /// Streams the completion of [prompt] as text chunks.
+  Stream<String> generate(
+    String prompt, {
+    GenerationOptions options = const GenerationOptions(),
+  }) =>
+      generateTokens(prompt, options: options).map((e) => e.text);
 }

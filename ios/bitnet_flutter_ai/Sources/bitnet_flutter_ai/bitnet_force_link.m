@@ -30,6 +30,13 @@ extern int32_t bn_prompt(void *, const char *, int32_t, char **);
 extern char *bn_next_token(void *, int32_t *, char **);
 extern int32_t bn_context_size(const void *);
 extern const char *bn_meta(const void *, const char *);
+// ABI v2
+extern int32_t bn_abi_version(void);
+extern int32_t bn_set_sampling(void *, const void *, const char *, char **);
+extern char *bn_next_token_ex(void *, int32_t *, float *, char **);
+extern int32_t bn_token_count(const void *, const char *, int32_t);
+extern void bn_set_abort_flag(void *, volatile int32_t *);
+extern int32_t bn_last_prompt_reused(const void *);
 
 __attribute__((used))
 const void *bitnet_force_link_refs[] = {
@@ -40,4 +47,10 @@ const void *bitnet_force_link_refs[] = {
     (const void *)&bn_next_token,
     (const void *)&bn_context_size,
     (const void *)&bn_meta,
+    (const void *)&bn_abi_version,
+    (const void *)&bn_set_sampling,
+    (const void *)&bn_next_token_ex,
+    (const void *)&bn_token_count,
+    (const void *)&bn_set_abort_flag,
+    (const void *)&bn_last_prompt_reused,
 };

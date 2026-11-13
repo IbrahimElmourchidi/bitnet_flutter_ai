@@ -1,14 +1,17 @@
 # bitnet\_flutter\_ai
 
-> **Beta — `0.2.0-beta.1`.**  
-> The public API is stable in shape but may change before `1.0.0`. The Web WASM artefact is not yet published to pub.dev — see [Building Native Libraries](#building-native-libraries) below.
+> **Beta — `0.3.0-beta.1`.**  
+> The public API is stable in shape but may change before `1.0.0` (0.3.0 has
+> breaking changes — see the [CHANGELOG](CHANGELOG.md) for migration steps).
+> The Web WASM artefact is not published to pub.dev — see
+> [Building Native Libraries](#building-native-libraries) below.
 
 Run Microsoft's [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) — and nine other ternary/1-bit models from TII and PrismML — **fully on-device**, no server, no API key. See [Model catalog](#model-catalog).
 
 | Platform | Status |
 |---|---|
-| Android (arm64-v8a / x86\_64) | Working — prebuilt `.so` shipped in `jniLibs/` |
-| iOS (arm64 device + simulator) | Working — prebuilt `.xcframework` shipped in `ios/Frameworks/`; verified in the simulator |
+| Android (arm64-v8a / x86\_64) | Working — prebuilt `.so` shipped in `jniLibs/`; verified on the emulator |
+| iOS (arm64 device + simulator) | Prebuilt `.xcframework` shipped in `ios/Frameworks/` (0.3.0 needs the ABI v2 rebuild — see [iOS](#ios)) |
 | Linux (x86\_64) | Working — verified end-to-end |
 | Web (desktop Chrome / Firefox) | Working — build with `tool/build_web.sh` (single-threaded, ~1–2 tok/s; desktop only; bitnet.cpp backend only) |
 | macOS (arm64 / x86\_64) | Planned — native build required |
@@ -33,16 +36,33 @@ Run Microsoft's [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.
 
 ## Requirements
 
-| Requirement | Minimum |
+### Toolchain
+
+| Tool | Minimum | Notes |
+|---|---|---|
+| Flutter | **3.50.0** | |
+| Dart SDK | **3.14.0** | `environment: sdk: ^3.14.0` |
+| Gradle (Android host app) | **9.3.1** | Enforced by Flutter 3.50 (`gradle-wrapper.properties`) |
+| Android Gradle Plugin | **9.3.1** recommended | The plugin module is Java-only, so it also builds under AGP 8 |
+| JDK | 17 | Gradle 9.5 also runs on JDK 21 / 25 |
+| Xcode (iOS / macOS) | 16 | Swift Package Manager or CocoaPods |
+
+### Platforms
+
+| Platform | Minimum OS | ABIs | Notes |
+|---|---|---|---|
+| Android | **API 24** (Android 7.0) — `minSdk 24` | `arm64-v8a`, `x86_64` | Build with `compileSdk 36`. Thermal status needs API 29+ (reported as `unknown` below). |
+| iOS | **14.0** | `arm64` (device), `arm64`/`x86_64` (simulator) | `os_proc_available_memory` (available RAM) needs iOS 13+. |
+| macOS | 12.0 | `arm64`, `x86_64` | Bridge must be built from source. |
+| Linux | — | `x86_64` | Bridge built from source (CMake; see BUILD_GUIDE.md). |
+| Web | Chrome 92+ / Firefox 90+ (desktop) | wasm32 | Requires [COI headers](#web-setup); bitnet.cpp backend only. |
+
+### Device
+
+| Resource | Minimum |
 |---|---|
-| Flutter | 3.24.0 |
-| Dart SDK | 3.5.0 |
-| Physical RAM | 3072 MB (enforced at runtime) |
-| Disk space | ~750 MB (GGUF model file) |
-| Android | API 24 (arm64-v8a) |
-| iOS | 14.0 (arm64) |
-| macOS | 12.0 |
-| Web | Chrome 92+ / Firefox 90+ with [COI headers](#web-setup) |
+| Physical RAM | per model — `BitNetModelInfo.minimumRamBytes` (2–6 GB), enforced at `load()` |
+| Free disk | the model file: 0.46 GB (Bonsai 1.7B) to 4 GB (Falcon3 10B); 1.19 GB for the default BitNet 2B-4T |
 
 ---
 
@@ -52,7 +72,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  bitnet_flutter_ai: ^0.2.0-beta.1
+  bitnet_flutter_ai: ^0.3.0-beta.1
 ```
 
 Then run:
@@ -68,135 +88,95 @@ flutter pub get
 ```dart
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
 
-Future<void> main() async {
-  final engine = BitNetEngine();
+final engine = BitNetEngine(model: BitNetCatalog.defaultModel);
+await engine.load(onProgress: (p) => print('Downloading: ${(p * 100).toInt()}%'));
 
-  // 1. Load — downloads the model on first run (~745 MiB), then loads from cache.
-  await engine.load(
-    onProgress: (progress) {
-      final pct = (progress * 100).toInt();
-      print('Downloading model: $pct%');
-    },
-  );
+final session = BitNetSession(
+  engine: engine,
+  systemPrompt: 'You are a helpful, concise assistant.',
+);
+await for (final text in session.chat('Explain ternary quantization')) {
+  stdout.write(text);
+}
 
-  // 2. Generate — returns a Stream<String> of token pieces.
-  final buffer = StringBuffer();
-  await for (final token in engine.generate('Explain ternary quantization in one paragraph')) {
-    buffer.write(token);
-    print(token); // stream tokens as they arrive
-  }
+await engine.dispose(); // frees the model and the inference isolate
+```
 
-  print('\n--- Full response ---\n$buffer');
+### Structured extraction (e.g. expense parsing)
 
-  // 3. Dispose — frees native memory and kills the inference isolate.
-  await engine.dispose();
+`extract` returns JSON of exactly the shape you declare — decoding is
+grammar-constrained, so it always parses — plus how sure the model was:
+
+```dart
+const expense = JsonShape({
+  'amount': JsonField.number(description: 'Amount of money spent'),
+  'currency': JsonField.enumOf(['EGP', 'USD', 'EUR'],
+      description: 'Assume EGP when not stated'),
+  'vendor': JsonField.string(nullable: true, description: 'Shop or payee'),
+  'category': JsonField.enumOf(['food', 'groceries', 'transport', 'utilities', 'other']),
+  'date': JsonField.date(nullable: true),
+});
+
+final r = await session.extract(
+  'I spent 250 EGP at the supermarket yesterday',
+  shape: expense,
+  instructions: "Extract the expense from the user's sentence.",
+  examples: const [
+    ExtractExample('electricity bill 150', {'amount': 150, 'currency': 'EGP',
+        'vendor': null, 'category': 'utilities', 'date': null}),
+  ],
+  today: DateTime.now(),
+);
+
+if (r.isConfident(0.5)) {
+  save(r.value);                    // {amount: 250.0, currency: EGP, …}
+} else {
+  askUserToConfirm(r.value, highlight: r.uncertainFields());
 }
 ```
 
-### Higher-level APIs
+Everything except the input text forms a stable prompt prefix that stays in
+the native KV cache, so the second and later extractions only process the new
+sentence (3–5× faster prefill in our measurements).
 
-`BitNetEngine` is the low-level token streamer. For most apps, prefer the
-higher-level helpers:
+### More helpers
 
 ```dart
 // Pick a model that fits the device.
 final profile = await DeviceProfile.current();
 final model = BitNetCatalog.compatibleWith(profile.totalRamBytes).first;
-print('Estimated speed: ~${profile.estimateTokensPerSecond(model)} tok/s');
 
-// Load engine + chat session.
-final engine = BitNetEngine(model: model);
-await engine.load();
-final session = BitNetSession(engine: engine, model: model)
-  ..setSystemPrompt('You are a helpful, concise assistant.');
-
-// Stream a chat reply (history is tracked across calls).
-await for (final piece in session.chat('Hello!')) stdout.write(piece);
-
-// One-shot helpers.
-final tldr = await session.summarize(longText, style: 'tldr');
-final answer = await session.assist('What is BitNet?');
+// One-shot helpers (do not touch chat history).
+final tldr = await session.summarize(longText, style: SummaryStyle.tldr);
+final answer = await session.assist('What is BitNet?', context: snippets);
 
 // On-device RAG over bundled assets.
 final rag = BitNetRag(
   session: session,
   source: AssetKnowledgeSource(assetPaths: ['assets/knowledge/faq.md']),
 );
-await rag.warmUp();
 final result = await rag.ask('How big is the download?');
-print(result.answer);
-for (final c in result.citations) print('  - ${c.chunk.source}');
+
+// Defer heavy work when the device is hot / saving power / low on memory.
+final health = await DeviceInspector.instance.health();
+if (health.shouldThrottle) scheduleLater();
 ```
 
-See the `example/` app for a complete tabbed demo of every public API.
-
-### Streaming to a Flutter widget
-
-```dart
-class ChatPage extends StatefulWidget { ... }
-
-class _ChatPageState extends State<ChatPage> {
-  final _engine = BitNetEngine();
-  final _response = ValueNotifier('');
-  bool _loading = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadEngine();
-  }
-
-  Future<void> _loadEngine() async {
-    setState(() => _loading = true);
-    await _engine.load(onProgress: (_) {});
-    setState(() => _loading = false);
-  }
-
-  Future<void> _send(String prompt) async {
-    _response.value = '';
-    await for (final token in _engine.generate(prompt)) {
-      _response.value += token;
-    }
-  }
-
-  @override
-  void dispose() {
-    _engine.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) return const Center(child: CircularProgressIndicator());
-    return Column(
-      children: [
-        ValueListenableBuilder<String>(
-          valueListenable: _response,
-          builder: (_, text, __) => SelectableText(text),
-        ),
-        ElevatedButton(
-          onPressed: () => _send('Hello, who are you?'),
-          child: const Text('Ask'),
-        ),
-      ],
-    );
-  }
-}
-```
+Several sessions may share one engine (e.g. an extractor and an advisor chat).
+Generations are queued in call order and never interleave.
 
 ### Cancellation
 
 ```dart
-// Start generation in the background.
-final sub = engine.generate('Write a long essay').listen((token) {
-  print(token);
-});
-
-// Cancel after 2 seconds.
-await Future.delayed(const Duration(seconds: 2));
-await engine.cancelGeneration();
-await sub.cancel();
+final sub = session.chat('Write a long essay').listen(stdout.write);
+await session.stop();   // or engine.cancelGeneration(), or sub.cancel()
 ```
+
+On native platforms cancellation is immediate even during a long prompt
+prefill (a shared native flag the C layer polls); on web it takes effect at the
+next token.
+
+See the `example/` app for a tabbed demo of every public API.
 
 ---
 
@@ -204,26 +184,39 @@ await sub.cancel();
 
 ### `BitNetEngine`
 
-```dart
-factory BitNetEngine({BitNetModel model = BitNetModel.bitnet2B4T})
-```
-
-Creates an engine for `model`. Uses a background `Isolate` on native platforms and
-`dart:js_interop` on Web.
-
-| Method / getter | Description |
+| Member | Description |
 |---|---|
-| `Future<void> load({void Function(double)? onProgress})` | Downloads (if needed), verifies SHA-256, and loads the model. `onProgress` receives `[0.0, 1.0]`. |
-| `bool get isLoaded` | `true` after a successful `load()`. |
-| `Stream<String> generate(String prompt, {int maxNewTokens = 512, bool addBos = true})` | Streams token pieces until EOS or `maxNewTokens`. Throws `BitNetNotLoadedException` if not loaded. |
-| `Future<void> cancelGeneration()` | Signals the worker to stop at the next token boundary. |
-| `Future<void> dispose()` | Frees all native resources. Do not use the engine after calling this. |
+| `BitNetEngine({BitNetModelInfo model})` | Native isolate engine, or WASM worker engine on web. |
+| `BitNetModelInfo get model` | The model it runs (sessions take their chat template from it). |
+| `Future<void> load({onProgress})` | Downloads (if needed), verifies SHA-256 and loads. Concurrent calls share one load. |
+| `Stream<TokenEvent> generateTokens(String prompt, {GenerationOptions options})` | Raw completion of a templated prompt: text chunks + per-token log-probabilities. |
+| `Stream<String> generate(String prompt, {GenerationOptions options})` | Text-only convenience. |
+| `Future<int> countTokens(String text, {bool addBos})` | Tokens the text occupies in the context window. |
+| `Future<void> cancelGeneration()` | Stops the running generation; its stream completes with what was produced. |
+| `Future<void> dispose()` | Frees the model and the isolate / WASM context. |
+
+### `GenerationOptions`
+
+`GenerationOptions()` — light sampling (temperature 0.7, top-k 40, top-p 0.95,
+repetition penalty 1.3) for chat. `GenerationOptions.precise()` — greedy, no
+penalty, for structured or reproducible output. Both accept `maxNewTokens`, a
+GBNF `grammar` (root rule `root`) and extra `stop` strings.
+
+### `BitNetSession`
+
+| Member | Description |
+|---|---|
+| `chat(message)` | Streams a reply; history is kept and trimmed by token budget. |
+| `extract(text, shape:, instructions:, examples:, today:)` | Grammar-constrained JSON + `ExtractResult.confidence` / `fieldConfidence`. |
+| `summarize(text, style:)` / `assist(question, context:)` | Stateless one-shots. |
+| `stop()` | Cancels the running generation. |
+| `history`, `clearHistory()`, `setSystemPrompt()` | Conversation state. |
 
 ### Model catalog
 
 `BitNetCatalog.all` lists the curated, SHA-256-pinned models. Pick one with
 `BitNetCatalog.compatibleWith(ramBytes)` (best fit first) or by id, and pass it
-to `BitNetEngine(model: ...)` / `BitNetSession(model: ...)`.
+to `BitNetEngine(model: ...)`.
 
 | Model | Params | Quant | Backend | Min RAM | License |
 |---|---|---|---|---|---|
@@ -238,36 +231,36 @@ to `BitNetEngine(model: ...)` / `BitNetSession(model: ...)`.
 | `prism-ml/Ternary-Bonsai-4B` | 4.0B | Q2_0 | prismQ2† | 3 GB | Apache-2.0 |
 | `prism-ml/Ternary-Bonsai-8B` | 8.2B | Q2_0 | prismQ2† | 5 GB | Apache-2.0 |
 
-Each `BitNetModelInfo` carries `id`, `ggufFileName`, `ggufDownloadUrl`,
-`ggufSha256`, `minimumRamBytes`/`recommendedRamBytes`, `contextLength` (capped
-at 4096), a `chatTemplate` (`ChatTemplateFamily`), and an `engineBackend`.
+**Languages:** BitNet 2B-4T and Falcon3 are English-centric. For other
+languages (e.g. Arabic input) prefer the Qwen3-based Ternary Bonsai models.
 
 † **PrismML "Ternary Bonsai"** uses an incompatible `qwen3`/`Q2_0` format, so it
 runs on a **second native library** (`libprism_bridge.so`, built from PrismML's
-llama.cpp fork — see [Building Native Libraries](#building-native-libraries)).
+llama.cpp fork `prism` branch — see [Building Native Libraries](#building-native-libraries)).
 Both backends share the `bn_*` C ABI; the engine picks the right library from
-`model.engineBackend`. The Bonsai models are **native-only** (no WASM build
-yet) and their `.so` is separate from the bitnet.cpp trio — ship it only if you
-use them.
+`model.engineBackend`. Bonsai is native-only (no WASM build yet).
 
 ### `ModelCache`
 
-Static utility — direct use is optional (the engine calls it internally).
+Static utility — the engine calls it internally. Models are stored outside
+device backups: Android `getNoBackupFilesDir()`, iOS/macOS Application Support
+flagged `NSURLIsExcludedFromBackupKey`.
 
 ```dart
-// Check if model is already cached.
-final path = await ModelCache.modelPath(BitNetModel.bitnet2B4T);
-
-// Delete model + any partial download.
-await ModelCache.clearModel(BitNetModel.bitnet2B4T);
+final cached = await ModelCache.isCached(BitNetCatalog.defaultModel);
+await ModelCache.clearModel(BitNetCatalog.defaultModel);
 ```
 
 ### `DeviceInspector`
 
 ```dart
-final bool capable = await DeviceInspector.instance.meetsMinimumRam();
-final int ramBytes = await DeviceInspector.instance.totalPhysicalRamBytes();
+final health = await DeviceInspector.instance.health();
+// DeviceHealth(total, available RAM, lowMemory, thermal, lowPowerMode)
 ```
+
+Uses Dart 3.14 direct native interop — JNIgen bindings on Android
+(`jnigen.yaml`), Foundation via `package:objective_c` on iOS/macOS — so it
+works from any isolate (no platform channel).
 
 ### Exceptions
 
@@ -275,27 +268,17 @@ All exceptions extend `BitNetException implements Exception`.
 
 | Exception | Thrown when |
 |---|---|
-| `BitNetUnsupportedDeviceException` | Physical RAM < 3072 MB |
-| `BitNetUnsupportedPlatformException` | Platform not supported (e.g. Safari without WASM threads) |
-| `BitNetLibraryLoadException` | Native `.so` / `.dylib` / `.dll` could not be opened |
-| `BitNetInitException` | `bn_init` returned `NULL` (model file corrupt or wrong path) |
-| `BitNetInferenceException` | `bn_prompt` or `bn_next_token` returned an error |
-| `BitNetHashMismatchException` | SHA-256 of downloaded file does not match expected |
-| `BitNetDownloadException` | Network error or unexpected HTTP status |
-| `BitNetNotLoadedException` | `generate()` called before `load()` |
-| `BitNetIsolateException` | Inference isolate exited unexpectedly |
-
-```dart
-try {
-  await engine.load();
-} on BitNetUnsupportedDeviceException catch (e) {
-  print('Not enough RAM: ${e.availableRamBytes ~/ (1024 * 1024)} MB available');
-} on BitNetDownloadException catch (e) {
-  print('Download failed (HTTP ${e.httpStatusCode}): ${e.message}');
-} on BitNetException catch (e) {
-  print('Engine error: $e');
-}
-```
+| `BitNetUnsupportedDeviceException` | Physical RAM below the model's minimum |
+| `BitNetUnsupportedPlatformException` | Platform / backend not supported (e.g. Bonsai on web) |
+| `BitNetLibraryLoadException` | Native library missing, or a stale build predating ABI v2 |
+| `BitNetInitException` | Model could not be loaded |
+| `BitNetInferenceException` | Prefill / decode / sampler (e.g. invalid grammar) error |
+| `BitNetPromptTooLongException` | Prompt does not fit in the context window |
+| `BitNetExtractionException` | `extract` output was cut short (e.g. `maxNewTokens`) |
+| `BitNetHashMismatchException` | SHA-256 of downloaded file does not match |
+| `BitNetDownloadException` | Network error / incomplete download (resumes next call) |
+| `BitNetNotLoadedException` | Generation requested before `load()` / after `dispose()` |
+| `BitNetIsolateException` | Inference isolate died, or engine disposed while loading |
 
 ---
 
@@ -390,12 +373,13 @@ The output `libbitnet_bridge.so` must be placed in
 
 Prebuilt `.xcframework`s already ship in `ios/Frameworks/` (device `arm64` +
 simulator `arm64`/`x86_64`) and are wired up via `vendored_frameworks` in the
-podspec — no build step needed to consume the package. `bitnet_bridge.xcframework`
+podspec. `bitnet_bridge.xcframework`
 is a static archive merged with llama/ggml, resolved at runtime through
 `DynamicLibrary.process()`; `prism_bridge.xcframework` is a self-contained
 dynamic framework, resolved through `DynamicLibrary.open(path)`. Rebuild them
-only if you're changing the native bridge itself (Xcode + cmake + ninja +
-libtool/lipo required):
+whenever the C ABI changes — **0.3.0 (ABI v2) needs a rebuild**; until then the
+engine refuses the old frameworks with a `BitNetLibraryLoadException`. Requires
+macOS with Xcode + cmake + ninja + libtool/lipo:
 
 ```bash
 BITNET_CPP=../bitnet.cpp ./tool/build_ios.sh              # bitnet_bridge.xcframework
@@ -424,9 +408,11 @@ the two `<script>` tags from [Web Setup](#web-setup).
 
 Only needed if you use a `Ternary-Bonsai-*` model. It builds a **separate**
 self-contained library from PrismML's llama.cpp fork (a different ggml ABI
-than bitnet.cpp — the two libraries never share symbols). Android and iOS
-prebuilts already ship in `jniLibs/` and `ios/Frameworks/` respectively —
-only rebuild if you're changing the bridge itself.
+than bitnet.cpp — the two libraries never share symbols). The fork checkout
+must be **recent enough to define `GGML_TYPE_Q2_0`** (the `prism` branch as of
+late 2026 does; an older checkout builds fine but fails to load any Bonsai
+GGUF with "tensor ... has offset ..., expected ..."). Check with
+`grep GGML_TYPE_Q2_0 <fork>/ggml/include/ggml.h`.
 
 ```bash
 git clone --branch prism https://github.com/PrismML-Eng/llama.cpp.git ../prism-llama.cpp
@@ -434,6 +420,10 @@ git clone --branch prism https://github.com/PrismML-Eng/llama.cpp.git ../prism-l
 ANDROID_NDK=$HOME/Android/Sdk/ndk/<ver> ./tool/build_android_prism.sh   # arm64-v8a + x86_64
 ./tool/build_ios_prism.sh                                               # prism_bridge.xcframework
 ```
+
+Every script — bitnet and prism — must be re-run after changing the C ABI
+(0.3.0 introduced ABI v2; the Dart side refuses older libraries with a clear
+error).
 
 All three scripts drive `native/prism/CMakeLists.txt`, which links the fork
 static and version-scripts the output down to just the `bn_*` C ABI. The
@@ -446,46 +436,50 @@ yet.
 ## Architecture
 
 ```
-BitNetEngine (interface)
- ├── NativeEngine          — runs on native (Android/iOS/Desktop)
- │    ├── Isolate           dart:isolate worker (non-blocking UI)
- │    └── NativeLibrary     dart:ffi → libbitnet_bridge
- │         └── BitNetBindings  (ffigen-generated)
- │              └── bitnet_bridge.cc  (llama.cpp C API wrapper)
- │
- └── WebEngine             — runs on Web
-      └── dart:js_interop  → window.BitNetWasm (Emscripten WASM)
+BitNetSession              — chat / extract / summarize / assist (prompt templates,
+ │                           token-budget history, JSON grammars, confidence)
+ └── BitNetEngine (interface; generations are queued, never interleaved)
+      ├── NativeEngine     — Android / iOS / desktop
+      │    ├── Isolate      background worker (UI never blocks)
+      │    └── NativeLibrary  dart:ffi → bn_* C ABI v2 (ffigen bindings)
+      │         ├── bitnet_bridge.cc ─┐  shared core: native/bn_core.inc
+      │         └── prism_bridge.cc  ─┘  (sampling, grammar, KV reuse, abort)
+      └── WebEngine        — Web: dart:js_interop → Web Worker → WASM
 
-ModelCache                 — HTTP download, SHA-256 verify, disk cache
-DeviceInspector            — platform RAM detection (fail-closed gate)
+ModelCache                 — resumable download, SHA-256, backup-excluded storage
+DeviceInspector            — RAM / thermal / power via JNIgen (Android) and
+                             Objective-C interop (iOS/macOS); no platform channel
 ```
 
 **Inference flow:**
 
-1. `engine.load()` — device check → model download/verify → spawn isolate → `bn_init`
-2. `engine.generate(prompt)` — `bn_prompt` (prefill) → `bn_next_token` loop → stream
-3. Each `bn_next_token` call: `llama_sampler_sample` → `llama_token_to_piece` → `llama_decode`
+1. `engine.load()` — RAM gate → download / verify → spawn isolate → `bn_init`
+   → `bn_abi_version` check.
+2. `generateTokens(prompt, options)` — `bn_set_sampling` (only when options
+   change) → `bn_prompt` (re-uses the longest cached KV prefix) →
+   `bn_next_token_ex` loop (token bytes + log-probability) → UTF-8 reassembly
+   → stop-marker detection → stream.
+3. `cancelGeneration()` sets a shared native flag that the C layer polls during
+   prefill and before every token.
 
 ---
 
 ## Beta Limitations
 
 - Prebuilt libraries ship for Android (`arm64-v8a`, `x86_64`) and iOS (device
-  `arm64` + simulator). macOS and Windows still require building the bridge
-  from source; web is built with `tool/build_web.sh`. Nothing is distributed
-  via pub.dev yet.
-- iOS is verified in the **simulator only** — not yet run on a physical device.
-- The PrismML (`Ternary-Bonsai-*`, Q2\_0) backend is **native-only**: Android
-  and iOS, no Web build of the fork yet.
+  `arm64` + simulator). macOS and Windows require building the bridge from
+  source; web is built with `tool/build_web.sh`.
+- iOS has been verified in the **simulator only**, not yet on a physical device.
+- The PrismML (`Ternary-Bonsai-*`, Q2\_0) backend is **native-only**, and the
+  bundled Android/Linux PrismML libraries must be rebuilt from a recent
+  `prism` branch of the fork to load Bonsai models (see
+  [PrismML backend](#prismml-ternary-bonsai-backend)).
 - Web is **desktop-browser only** and **single-threaded scalar** (~1–2 tok/s for
-  the 2B model). The ~1.1 GB model lives in the WASM heap during inference, so a
-  tab needs multi-GB of memory — mobile browsers will OOM. Threading and a
-  `wasm_simd128` kernel are the planned speed follow-ups.
-- `cancelGeneration()` on Web cancels only at `yield` boundaries — there is no
-  signal to interrupt the synchronous WASM decode call mid-token.
-- macOS and Windows are untested in this beta.
-- No sampling parameter control yet (temperature, top-p). Greedy sampling is used.
-- The model is not instruction-tuned by default; wrap your prompt in the appropriate chat template for best results.
+  the 2B model). The ~1.1 GB model lives in the WASM heap, so mobile browsers
+  will run out of memory. Cancellation on web takes effect at the next token.
+- macOS and Windows are untested.
+- BitNet 2B-4T and Falcon3 are English-centric; use a Bonsai model for other
+  languages.
 
 ---
 

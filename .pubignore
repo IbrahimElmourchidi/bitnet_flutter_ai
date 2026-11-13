@@ -1,0 +1,55 @@
+# .pubignore — what pub.dev must not receive. A root .pubignore REPLACES
+# .gitignore for pub, so the git rules are repeated below.
+
+# Local teaching site / planning notes (not part of the package).
+docs/
+.sisyphus/
+step_by_step_build_guides/
+
+# ---- copied from .gitignore ----
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+# Libraries should not include pubspec.lock, per https://dart.dev/guides/libraries/private-files#pubspeclock.
+/pubspec.lock
+**/doc/api/
+.dart_tool/
+.flutter-plugins-dependencies
+/build/
+/coverage/
+
+# Native build scratch (CMake/Ninja trees produced by tool/build_*.sh).
+# Only the staged, final artifacts (android/src/main/jniLibs/, linux/, web/,
+# example/web/) are committed — these directories are large, environment-
+# specific, and fully reproducible from the build scripts.
+native/build-*/
+# Fat/merged static libs assembled by the iOS build before they are packaged
+# into ios/Frameworks/*.xcframework.
+native/merged-ios-*/
+**/android/local.properties
+
+# Claude Code local (per-machine) settings.
+.claude/settings.local.json
+step_by_step_build_guides/*
+.sisyphus/plans/concepts-guide-site.md

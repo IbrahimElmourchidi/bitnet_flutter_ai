@@ -321,15 +321,27 @@ gcc smoke_test.c -o build-linux/smoke_test \
     "Hello, who are you?"
 ```
 
-Dart-only smoke test (exercises the actual FFI surface used by
-`BitNetEngine`):
+ABI v2 smoke test (`native/test/abi_v2_smoke.c`) — token counting, KV prefix
+reuse, grammar-constrained JSON with log-probabilities, greedy determinism,
+abort from another thread, and the typed too-long error:
 
 ```bash
 cd bitnet_flutter_ai
-LD_LIBRARY_PATH="$PWD/native/build-linux:$PWD/../bitnet.cpp/build-linux/3rdparty/llama.cpp/src:$PWD/../bitnet.cpp/build-linux/3rdparty/llama.cpp/ggml/src" \
-    dart run tool/dart_smoke.dart \
-    ../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
-    "Explain ternary quantization in one sentence." 40
+cc -O2 -pthread -Inative native/test/abi_v2_smoke.c \
+    -Lnative/build-linux -lbitnet_bridge -lm \
+    -Wl,-rpath,$PWD/native/build-linux -o /tmp/abi_v2_smoke
+/tmp/abi_v2_smoke ../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf
+# PrismML: link -lprism_bridge from native/build-linux-prism and pass "chatml"
+```
+
+Full-stack Dart test (session → isolate → FFI → C), skipped unless
+`BITNET_MODEL` is set:
+
+```bash
+cd bitnet_flutter_ai
+BITNET_MODEL=../bitnet.cpp/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+LD_LIBRARY_PATH="$PWD/native/build-linux:$PWD/../bitnet.cpp/stage/lib:$PWD/../bitnet.cpp/build-linux/3rdparty/llama.cpp/ggml/src" \
+    flutter test test/real_model_test.dart
 ```
 
 ### 3f. Copy outputs into the package's `linux/` desktop folder

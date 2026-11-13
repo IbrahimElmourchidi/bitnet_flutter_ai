@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 
 import '../diagnostics/bitnet_log.dart';
 import '../engine/bitnet_engine.dart';
+import '../engine/generation_options.dart';
 import '../exceptions/bitnet_exception.dart';
 import '../model/bitnet_model_info.dart';
 import 'chat_templates.dart';
+import 'json_shape.dart';
 
 /// Role of a participant in a chat conversation.
 enum ChatRole { system, user, assistant }
@@ -19,198 +22,301 @@ class ChatTurn {
   String toString() => '${role.name}: $content';
 }
 
-/// A stateful chat wrapper around a [BitNetEngine].
+/// Output style for [BitNetSession.summarize].
+enum SummaryStyle {
+  /// One short paragraph.
+  paragraph,
+
+  /// 3–7 concise bullets.
+  bullets,
+
+  /// A single sentence.
+  tldr,
+}
+
+/// High-level, prompt-template-aware API over a [BitNetEngine].
 ///
-/// Maintains the running list of [ChatTurn]s, applies a simple
-/// chat-formatted prompt template before each call to the underlying
-/// engine, and exposes high-level helpers ([summarize], [assist]) that
-/// are stateless and do not mutate the session history.
+/// * [chat] — multi-turn conversation with automatic history management.
+/// * [extract] — structured JSON extraction with per-field confidence
+///   (grammar-constrained, so the output always parses).
+/// * [summarize] / [assist] — stateless one-shot helpers.
 ///
-/// Typical usage:
 /// ```dart
-/// final engine = BitNetEngine();
+/// final engine = BitNetEngine(model: BitNetCatalog.defaultModel);
 /// await engine.load();
-/// final session = BitNetSession(engine: engine);
-/// session.setSystemPrompt('You are a friendly Flutter expert.');
-/// await for (final piece in session.chat('What is BitNet?')) {
-///   stdout.write(piece);
+/// final session = BitNetSession(engine: engine,
+///     systemPrompt: 'You are a friendly finance assistant.');
+/// await for (final text in session.chat('How can I save more?')) {
+///   stdout.write(text);
 /// }
 /// ```
+///
+/// The prompt template comes from `engine.model`, so it always matches the
+/// loaded weights. Several sessions may share one engine (e.g. an extractor
+/// and an advisor chat); their generations are queued, never interleaved. A
+/// session does not own its engine — dispose the engine yourself.
 class BitNetSession {
   final BitNetEngine engine;
-  final BitNetModelInfo model;
 
-  /// Maximum number of past turns (user + assistant pairs) kept in the
-  /// prompt. Older turns are silently truncated to stay within the model's
-  /// context window. Defaults to 12 turns ≈ 6 exchanges.
+  /// Hard cap on remembered turns (user + assistant entries). Within the cap,
+  /// [chat] also drops the oldest turns whenever the prompt would not leave
+  /// room for the reply in the model's context window.
   final int maxHistoryTurns;
 
-  /// Default token budget for [chat] / [assist] / [summarize] when the
-  /// caller does not pass `maxNewTokens` explicitly.
-  final int defaultMaxNewTokens;
+  /// Decoding defaults for [chat], [summarize] and [assist]. ([extract]
+  /// always decodes greedily.)
+  final GenerationOptions options;
 
   final List<ChatTurn> _history = <ChatTurn>[];
   String? _systemPrompt;
 
+  /// Chat turns run strictly in order: a turn's prompt is built only once the
+  /// previous turn has settled, so its reply is part of the history.
+  Future<void> _chatChain = Future<void>.value();
+
   BitNetSession({
     required this.engine,
-    BitNetModelInfo? model,
+    String? systemPrompt,
     this.maxHistoryTurns = 12,
-    this.defaultMaxNewTokens = 512,
-  }) : model = model ?? BitNetCatalog.defaultModel;
+    this.options = const GenerationOptions(),
+  }) : _systemPrompt = systemPrompt; // ignore: prefer_initializing_formals
+
+  /// The model this session formats prompts for (always `engine.model`).
+  BitNetModelInfo get model => engine.model;
+
+  ChatTemplateSpec get _template => chatTemplateFor(model.chatTemplate);
 
   /// Read-only view of the running conversation.
   List<ChatTurn> get history => List.unmodifiable(_history);
 
-  /// Replaces the system prompt prepended to every turn. Pass `null` to
-  /// remove it.
-  void setSystemPrompt(String? prompt) {
-    _systemPrompt = prompt;
-  }
+  /// The system prompt prepended to every [chat] turn.
+  String? get systemPrompt => _systemPrompt;
+
+  /// Replaces the system prompt. Pass `null` to remove it.
+  void setSystemPrompt(String? prompt) => _systemPrompt = prompt;
 
   /// Wipes the conversation history (keeps the system prompt).
   void clearHistory() => _history.clear();
 
-  /// Streams the assistant's reply to [userMessage] piece-by-piece while
-  /// also appending both turns to [history] when the stream completes.
-  Stream<String> chat(
-    String userMessage, {
-    int? maxNewTokens,
-  }) {
-    if (!engine.isLoaded) {
-      throw const BitNetNotLoadedException();
-    }
-    final controller = StreamController<String>();
-    final buffer = StringBuffer();
+  // -------------------------------------------------------------------- chat
 
-    // Snapshot turns sent to the model — append the user turn _now_ so it
-    // appears in the formatted prompt, but don't commit to history until
-    // we have a full assistant reply.
-    _history.add(ChatTurn(ChatRole.user, userMessage));
-    _trimHistory();
-    final prompt = _formatChatPrompt(_history, _systemPrompt);
-    BitNetLog.log('session',
-        'chat() user=${userMessage.length}ch history=${_history.length} '
-        'prompt=${prompt.length}ch maxNewTokens=${maxNewTokens ?? defaultMaxNewTokens}');
-    BitNetLog.log('session.prompt', '\n$prompt');
-
-    // The history must reach exactly one of two end states, exactly once:
-    // either the assistant reply is committed, or the user turn we optimistically
-    // appended above is rolled back. Leaving a user turn with no assistant reply
-    // renders every later prompt as two consecutive user turns, which is
-    // malformed under every template and never recovers.
+  /// Streams the assistant's reply to [message].
+  ///
+  /// Both turns are appended to [history] once the reply completes. If the
+  /// stream is cancelled mid-reply, the partial reply is kept; if it fails
+  /// (or produced nothing), the user turn is rolled back so the history never
+  /// holds an unanswered message.
+  ///
+  /// Throws [BitNetNotLoadedException] synchronously if the engine is not
+  /// loaded; emits [BitNetPromptTooLongException] if [message] alone does not
+  /// fit in the context window.
+  Stream<String> chat(String message, {GenerationOptions? options}) {
+    if (!engine.isLoaded) throw const BitNetNotLoadedException();
+    final o = options ?? this.options;
+    final out = StreamController<String>();
+    final reply = StringBuffer();
+    StreamSubscription<TokenEvent>? sub;
+    var consumerGone = false;
     var settled = false;
+    final finished = Completer<void>();
 
-    void commitReply() {
+    void settle({required bool keepReply}) {
       if (settled) return;
       settled = true;
-      // Defensive: if a hallucinated turn-opener slipped past the streaming
-      // TurnStopDetector (e.g. a marker split oddly across pieces, or an
-      // opener variant not in the list), strip it before it enters history.
-      // Without this, one leaked "User: …/ANSWER: …" tail is fed back on every
-      // subsequent turn and derails the whole conversation.
-      final reply = _sanitizeReply(buffer.toString());
-      BitNetLog.log('session',
-          'chat() done reply=${reply.length}ch: "${_truncate(reply, 200)}"');
-      _history.add(ChatTurn(ChatRole.assistant, reply));
-      _trimHistory();
-    }
-
-    void rollbackUserTurn() {
-      if (settled) return;
-      settled = true;
-      if (_history.isNotEmpty && _history.last.role == ChatRole.user) {
+      if (keepReply && reply.isNotEmpty) {
+        final text = _sanitizeReply(reply.toString());
+        BitNetLog.log('session', 'chat reply ${text.length}ch');
+        _history.add(ChatTurn(ChatRole.assistant, text));
+        _trimToCap();
+      } else if (_history.isNotEmpty && _history.last.role == ChatRole.user) {
         _history.removeLast();
       }
+      if (!finished.isCompleted) finished.complete();
     }
 
-    late StreamSubscription<String> sub;
-    try {
-      sub = engine
-          .generate(prompt, maxNewTokens: maxNewTokens ?? defaultMaxNewTokens)
-          .listen(
-        (piece) {
-          buffer.write(piece);
-          controller.add(piece);
-        },
-        onError: (Object err, StackTrace st) {
-          BitNetLog.log('session', 'chat() error: $err');
-          // Roll back the user turn on hard failures so the next call doesn't
-          // ship a half-broken history.
-          rollbackUserTurn();
-          controller.addError(err, st);
-          controller.close();
-        },
-        onDone: () {
-          commitReply();
-          controller.close();
-        },
-        cancelOnError: true,
-      );
-    } catch (_) {
-      // generate() rejects synchronously when the engine is busy or unloaded,
-      // and the user turn is already in `_history` by then. Undo it before the
-      // error escapes, or the next call renders two consecutive user turns.
-      rollbackUserTurn();
-      rethrow;
-    }
-
-    // Fires when the consumer walks away mid-stream (widget disposed, tab
-    // switched, `await for` broken out of) — onDone never runs in that case, so
-    // the history has to be settled here too. Cancelling `sub` propagates down
-    // to the engine, which stops the worker.
-    controller.onCancel = () async {
-      await sub.cancel();
-      if (buffer.isEmpty) {
-        rollbackUserTurn();
-      } else {
-        BitNetLog.log('session', 'chat() cancelled — committing partial reply');
-        commitReply();
-      }
+    out.onCancel = () async {
+      consumerGone = true;
+      // Cancelling the engine subscription stops the model (native: at once).
+      await sub?.cancel();
+      settle(keepReply: true);
     };
-    return controller.stream;
+
+    _chatChain = _chatChain.then((_) async {
+      if (consumerGone) return;
+      _history.add(ChatTurn(ChatRole.user, message));
+      try {
+        final prompt = await _fitChatPrompt(o);
+        if (consumerGone) {
+          settle(keepReply: false);
+          return;
+        }
+        sub = engine.generateTokens(prompt, options: o).listen(
+          (e) {
+            reply.write(e.text);
+            if (!consumerGone) out.add(e.text);
+          },
+          onError: (Object e, StackTrace st) {
+            settle(keepReply: false);
+            if (!consumerGone) out.addError(e, st);
+          },
+          onDone: () => settle(keepReply: true),
+          cancelOnError: true,
+        );
+        await finished.future;
+      } catch (e, st) {
+        settle(keepReply: false);
+        if (!consumerGone) out.addError(e, st);
+      } finally {
+        await out.close();
+      }
+    });
+    return out.stream;
   }
 
-  /// Stateless summarisation helper — does not touch [history].
+  /// Formats the history into a prompt that leaves room for the reply,
+  /// dropping the oldest turns as needed.
+  Future<String> _fitChatPrompt(GenerationOptions o) async {
+    _trimToCap();
+    final reserve = o.maxNewTokens == 0 ? 256 : o.maxNewTokens;
+    final budget = model.contextLength - reserve;
+    while (true) {
+      final prompt = _template.format(_history, _systemPrompt);
+      final n = await engine.countTokens(prompt, addBos: o.addBos);
+      if (n <= budget) return prompt;
+      if (_history.length <= 1) {
+        throw BitNetPromptTooLongException(
+            'message needs $n tokens; ${budget < 0 ? 0 : budget} available '
+            '(context ${model.contextLength} minus $reserve reserved for the reply)');
+      }
+      BitNetLog.log('session', 'prompt $n tokens > budget $budget — dropping oldest turn');
+      _history.removeAt(0);
+      _dropLeadingAssistant();
+    }
+  }
+
+  void _trimToCap() {
+    if (_history.length > maxHistoryTurns) {
+      _history.removeRange(0, _history.length - maxHistoryTurns);
+    }
+    _dropLeadingAssistant();
+  }
+
+  /// A window must open on a user turn: every template renders a leading bare
+  /// assistant reply as out-of-distribution text.
+  void _dropLeadingAssistant() {
+    while (_history.isNotEmpty && _history.first.role == ChatRole.assistant) {
+      _history.removeAt(0);
+    }
+  }
+
+  /// Cuts [reply] at the first end-of-turn / hallucinated turn-opener marker
+  /// (belt and braces over the streaming detector) and trims it.
+  String _sanitizeReply(String reply) {
+    var cut = -1;
+    for (final m in _template.stopMarkers) {
+      final idx = reply.indexOf(m);
+      if (idx != -1 && (cut == -1 || idx < cut)) cut = idx;
+    }
+    return (cut == -1 ? reply : reply.substring(0, cut)).trim();
+  }
+
+  // ----------------------------------------------------------------- extract
+
+  /// Extracts a JSON object of the given [shape] from [text].
   ///
-  /// [style] picks one of: `'paragraph'` (default), `'bullets'`, `'tldr'`.
+  /// Decoding is greedy and grammar-constrained, so the result always has
+  /// exactly [shape]'s keys and types. [ExtractResult.confidence] tells you
+  /// how sure the model was — e.g. ask the user to confirm below 0.5.
+  ///
+  /// * [instructions] — what the task is ("Extract the expense from the
+  ///   user's sentence"). The field list is appended automatically.
+  /// * [examples] — 2–3 worked examples; the biggest accuracy lever.
+  /// * [today] — adds today's date so relative dates ("yesterday") resolve.
+  ///
+  /// Everything except [text] forms a stable prompt prefix that the native
+  /// engine keeps in its KV cache, so repeated extractions with the same
+  /// shape/instructions/examples only process the new text.
+  ///
+  /// Throws [BitNetExtractionException] if generation stopped before the
+  /// object was complete (e.g. [maxNewTokens] too small, or cancelled).
+  Future<ExtractResult> extract(
+    String text, {
+    required JsonShape shape,
+    String? instructions,
+    List<ExtractExample> examples = const [],
+    DateTime? today,
+    int maxNewTokens = 192,
+  }) async {
+    if (!engine.isLoaded) throw const BitNetNotLoadedException();
+    final system = StringBuffer()
+      ..writeln((instructions ?? 'Extract structured data from the text.').trim())
+      ..writeln()
+      ..writeln('Reply with only a JSON object with these fields:')
+      ..writeln(shape.describe())
+      ..writeln('Use null for anything the text does not state.');
+    if (examples.isNotEmpty) {
+      system
+        ..writeln()
+        ..writeln('Examples:');
+      for (final ex in examples) {
+        system
+          ..writeln('Text: ${ex.text.trim()}')
+          ..writeln('JSON: ${jsonEncode(ex.output)}');
+      }
+    }
+    if (today != null) {
+      system
+        ..writeln()
+        ..write("Today's date: ${_isoDate(today)}.");
+    }
+    final prompt = _template.format(
+      [ChatTurn(ChatRole.user, text.trim())],
+      system.toString().trim(),
+    );
+
+    final events = <TokenEvent>[];
+    await for (final e in engine.generateTokens(
+      prompt,
+      options: GenerationOptions.precise(
+          maxNewTokens: maxNewTokens, grammar: shape.toGbnf()),
+    )) {
+      events.add(e);
+    }
+    final raw = events.map((e) => e.text).join().trim();
+    final result = shape.parse(raw, events);
+    BitNetLog.log('session', 'extract → $result');
+    return result;
+  }
+
+  static String _isoDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}'
+      '-${d.day.toString().padLeft(2, '0')}';
+
+  // --------------------------------------------------------- one-shot helpers
+
+  /// Summarises [text] (does not touch [history]).
   Future<String> summarize(
     String text, {
-    String style = 'paragraph',
-    int? maxNewTokens,
-  }) async {
-    if (!engine.isLoaded) {
-      throw const BitNetNotLoadedException();
-    }
+    SummaryStyle style = SummaryStyle.paragraph,
+    GenerationOptions? options,
+  }) {
     final instruction = switch (style) {
-      'bullets' =>
+      SummaryStyle.bullets =>
         'Summarise the following text as a concise bullet list (3-7 bullets):',
-      'tldr' =>
-        'Write a one-sentence TL;DR of the following text:',
-      _ => 'Summarise the following text in a single short paragraph:',
+      SummaryStyle.tldr => 'Write a one-sentence TL;DR of the following text:',
+      SummaryStyle.paragraph =>
+        'Summarise the following text in a single short paragraph:',
     };
-    final prompt = _formatInstructionPrompt(
-      instruction: instruction,
-      input: text,
-      systemPrompt: _systemPrompt,
-    );
-    return _collect(engine.generate(
-      prompt,
-      maxNewTokens: maxNewTokens ?? defaultMaxNewTokens,
-    ));
+    return _oneShot('$instruction\n\n${text.trim()}', options);
   }
 
-  /// Stateless assist/QA helper — answers [question] using optional
-  /// supporting [context] (e.g. retrieved RAG snippets). Does not touch
-  /// [history].
+  /// Answers [question], optionally grounded in [context] (e.g. retrieved
+  /// RAG snippets). Does not touch [history].
   Future<String> assist(
     String question, {
     String? context,
-    int? maxNewTokens,
-  }) async {
-    if (!engine.isLoaded) {
-      throw const BitNetNotLoadedException();
-    }
+    GenerationOptions? options,
+  }) {
     final body = StringBuffer();
     if (context != null && context.trim().isNotEmpty) {
       body
@@ -221,118 +327,30 @@ class BitNetSession {
         ..writeln(context.trim())
         ..writeln()
         ..writeln('### Question')
-        ..writeln(question.trim());
+        ..write(question.trim());
     } else {
       body
         ..writeln('Answer the following question concisely and accurately.')
         ..writeln()
         ..writeln('### Question')
-        ..writeln(question.trim());
+        ..write(question.trim());
     }
-    final prompt = _formatInstructionPrompt(
-      instruction: body.toString(),
-      input: '',
-      systemPrompt: _systemPrompt,
-    );
-    return _collect(engine.generate(
-      prompt,
-      maxNewTokens: maxNewTokens ?? defaultMaxNewTokens,
-    ));
+    return _oneShot(body.toString(), options);
   }
 
-  /// Disposes the underlying engine. Subsequent calls throw.
-  Future<void> dispose() async {
-    _history.clear();
-    await engine.dispose();
-  }
-
-  /// Interrupts the in-flight generation (if any) for [chat], [summarize]
-  /// or [assist]. The active stream / Future resolves with whatever was
-  /// generated up to the point of cancellation.
-  ///
-  /// Safe to call when nothing is in-flight — it is a no-op in that case.
-  Future<void> stop() async {
-    BitNetLog.log('session', 'stop() requested');
-    await engine.cancelGeneration();
-  }
-
-  // ---------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------
-
-  void _trimHistory() {
-    if (_history.length > maxHistoryTurns) {
-      _history.removeRange(0, _history.length - maxHistoryTurns);
-    }
-    // Trimming cuts on a raw entry count, so it can leave the window opening on
-    // an assistant turn. Every template then renders a prompt that starts with a
-    // bare model reply with no user turn before it — out of distribution, and
-    // for `bitnetLabeled` it emits content before the first `Human:` label.
-    // Drop those orphans so the window always starts on a user turn.
-    while (_history.isNotEmpty && _history.first.role == ChatRole.assistant) {
-      _history.removeAt(0);
-    }
-  }
-
-  static Future<String> _collect(Stream<String> s) async {
+  Future<String> _oneShot(String userText, GenerationOptions? options) async {
+    if (!engine.isLoaded) throw const BitNetNotLoadedException();
+    final prompt = _template.format(
+        [ChatTurn(ChatRole.user, userText)], _systemPrompt);
     final buf = StringBuffer();
-    await for (final piece in s) {
-      buf.write(piece);
+    await for (final e
+        in engine.generateTokens(prompt, options: options ?? this.options)) {
+      buf.write(e.text);
     }
-    return buf.toString().trim();
+    return _sanitizeReply(buf.toString());
   }
 
-  static String _truncate(String s, int n) =>
-      s.length <= n ? s : '${s.substring(0, n)}…';
-
-  /// Formats a multi-turn chat using the template family declared by [model]
-  /// (`model.chatTemplate`), resolved via [chatTemplateFor] in
-  /// `chat_templates.dart`.
-  ///
-  /// Each model family was supervised-fine-tuned on a specific format (BitNet's
-  /// `Human:`/`BITNETAssistant:` labels, Falcon3's `<|user|>` tags, ChatML, …);
-  /// feeding the wrong one is out-of-distribution and produces wrong or
-  /// degenerate output. The per-family formatters live in [kChatTemplates] and
-  /// mirror each model's embedded `tokenizer.chat_template`; they are hardcoded
-  /// (rather than read via `bn_meta`) so the Dart side controls stop markers and
-  /// history assembly, but they must MATCH the GGUF's template — the BitNet
-  /// 2B-4T one is `Human: … BITNETAssistant: …`, not the old `System:/User:`
-  /// labels (which gave canned, wrong answers).
-  String _formatChatPrompt(List<ChatTurn> turns, String? systemPrompt) =>
-      chatTemplateFor(model.chatTemplate).format(turns, systemPrompt);
-
-  /// Truncates [reply] at the first hallucinated turn-opener and trims
-  /// surrounding whitespace, so a fabricated next turn never enters history.
-  ///
-  /// The streaming [TurnStopDetector] normally strips these live, but this is a
-  /// belt-and-braces pass on the fully-assembled reply: it uses the SAME stop
-  /// markers as the detector (from the model's [ChatTemplateSpec]) and cuts at
-  /// the earliest one found anywhere in the text. Idempotent and cheap.
-  String _sanitizeReply(String reply) {
-    final markers = chatTemplateFor(model.chatTemplate).stopMarkers;
-    var cut = -1;
-    for (final m in markers) {
-      final idx = reply.indexOf(m);
-      if (idx != -1 && (cut == -1 || idx < cut)) cut = idx;
-    }
-    final trimmed = cut == -1 ? reply : reply.substring(0, cut);
-    return trimmed.trim();
-  }
-
-  String _formatInstructionPrompt({
-    required String instruction,
-    required String input,
-    String? systemPrompt,
-  }) {
-    final body = StringBuffer()..write(instruction.trim());
-    if (input.trim().isNotEmpty) {
-      body
-        ..write('\n\n')
-        ..write(input.trim());
-    }
-    return _formatChatPrompt(
-      [ChatTurn(ChatRole.user, body.toString())],
-      systemPrompt,
-    );
-  }
+  /// Stops the running generation (chat, extract, summarize or assist). Its
+  /// stream / Future completes with what was produced so far. No-op if idle.
+  Future<void> stop() => engine.cancelGeneration();
 }

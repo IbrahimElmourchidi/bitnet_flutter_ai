@@ -1,6 +1,6 @@
 name: bitnet_flutter_ai
 description: Run Microsoft BitNet b1.58 2B-4T locally on Android, iOS, desktop, and Web (WASM).
-version: 0.2.0-beta.1
+version: 0.3.0-beta.1
 homepage: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai
 repository: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai
 issue_tracker: https://github.com/IbrahimElmourchidi/bitnet_flutter_ai/issues
@@ -8,8 +8,8 @@ funding:
   - https://pub.dev/publishers/utanium.org/packages
 
 environment:
-  sdk: ^3.5.0
-  flutter: ">=3.24.0"
+  sdk: ^3.14.0
+  flutter: ">=3.50.0"
 
 dependencies:
   flutter:
@@ -21,21 +21,25 @@ dependencies:
   system_info2: ^4.0.0
   plugin_platform_interface: ^2.1.8
   path: ^1.9.1
+  jni: ^1.1.2
+  objective_c: ^9.6.4
+  jni_flutter: ^1.0.4+1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^4.0.0
-  ffigen: ^12.0.0
+  flutter_lints: ^6.0.0
+  ffigen: ^23.0.0
   test: ^1.25.0
   mocktail: ^1.0.4
   path_provider_platform_interface: ^2.1.2
+  jnigen: ^1.0.1
 
 flutter:
   plugin:
     platforms:
       android:
-        package: com.example.bitnet_flutter_ai
+        package: org.utanium.bitnet_flutter_ai
         pluginClass: BitnetFlutterAiPlugin
       ios:
         pluginClass: BitnetFlutterAiPlugin

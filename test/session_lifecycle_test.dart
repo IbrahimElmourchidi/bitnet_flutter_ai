@@ -1,87 +1,13 @@
-import 'dart:async';
-
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Engine that streams one token per event-loop turn, so a test can walk away
-/// mid-stream the way a disposed widget does.
-///
-/// [generatorTornDown] / [ranToCompletion] record how the stream ended: an
-/// `async*` body unwinds through its `finally` when the subscription is
-/// cancelled, which is exactly how the real engines learn to stop (NativeEngine
-/// turns that into a `_CmdCancel`, WebEngine into a `_cancelRequested` flag).
-class _SlowEngine implements BitNetEngine {
-  final List<String> tokens;
-
-  /// Wall-clock cost of a token. Real decode is tens of milliseconds per token,
-  /// and the cancellation tests need to land *between* two of them.
-  final Duration perToken;
-  var generatorTornDown = false;
-  var ranToCompletion = false;
-
-  _SlowEngine(this.tokens, {this.perToken = const Duration(milliseconds: 20)});
-
-  @override
-  bool get isLoaded => true;
-
-  @override
-  Future<void> load({void Function(double progress)? onProgress}) async {}
-
-  @override
-  Stream<String> generate(
-    String prompt, {
-    int maxNewTokens = 512,
-    bool addBos = true,
-  }) async* {
-    generatorTornDown = false;
-    ranToCompletion = false;
-    try {
-      for (final t in tokens) {
-        await Future<void>.delayed(perToken);
-        yield t;
-      }
-      ranToCompletion = true;
-    } finally {
-      generatorTornDown = true;
-    }
-  }
-
-  @override
-  Future<void> cancelGeneration() async {}
-
-  @override
-  Future<void> dispose() async {}
-}
-
-/// Engine that rejects [generate] synchronously, mimicking the busy/not-loaded
-/// guards in the real engines.
-class _ThrowingEngine implements BitNetEngine {
-  @override
-  bool get isLoaded => true;
-
-  @override
-  Future<void> load({void Function(double progress)? onProgress}) async {}
-
-  @override
-  Stream<String> generate(
-    String prompt, {
-    int maxNewTokens = 512,
-    bool addBos = true,
-  }) =>
-      throw const BitNetBusyException();
-
-  @override
-  Future<void> cancelGeneration() async {}
-
-  @override
-  Future<void> dispose() async {}
-}
+import 'support/fake_engine.dart';
 
 void main() {
   group('BitNetSession history is always settled', () {
     test('cancelling mid-stream commits the partial reply, not a dangling user '
         'turn', () async {
-      final engine = _SlowEngine(['He', 'llo', ' wor', 'ld']);
+      final engine = FakeEngine(tokens: ['He', 'llo', ' wor', 'ld'], perToken: const Duration(milliseconds: 20));
       final session = BitNetSession(engine: engine);
 
       final seen = StringBuffer();
@@ -105,7 +31,7 @@ void main() {
     });
 
     test('cancelling before any token rolls the user turn back', () async {
-      final engine = _SlowEngine(['a', 'b', 'c']);
+      final engine = FakeEngine(tokens: ['a', 'b', 'c'], perToken: const Duration(milliseconds: 20));
       final session = BitNetSession(engine: engine);
 
       final sub = session.chat('Hi').listen((_) {});
@@ -116,16 +42,19 @@ void main() {
           reason: 'an empty reply should leave no half-turn behind');
     });
 
-    test('a synchronous generate() rejection rolls the user turn back', () {
-      final session = BitNetSession(engine: _ThrowingEngine());
+    test('an engine error mid-reply surfaces on the stream and rolls the '
+        'user turn back', () async {
+      final session =
+          BitNetSession(engine: FakeEngine(tokens: ['a', 'b', 'c'], failAfter: 1));
 
-      expect(() => session.chat('Hi'), throwsA(isA<BitNetBusyException>()));
+      await expectLater(session.chat('Hi').toList(),
+          throwsA(isA<BitNetInferenceException>()));
       expect(session.history, isEmpty);
     });
 
     test('completing normally after a cancelled turn keeps the history '
         'alternating', () async {
-      final engine = _SlowEngine(['x', 'y', 'z']);
+      final engine = FakeEngine(tokens: ['x', 'y', 'z'], perToken: const Duration(milliseconds: 20));
       final session = BitNetSession(engine: engine);
 
       final sub = session.chat('first').listen((_) {});
@@ -149,7 +78,7 @@ void main() {
     test('never leaves the window opening on an assistant turn', () async {
       // maxHistoryTurns is odd, so a naive count-based trim lands mid-pair and
       // leaves a leading assistant turn.
-      final engine = _SlowEngine(['ok'], perToken: Duration.zero);
+      final engine = FakeEngine(tokens: ['ok']);
       final session = BitNetSession(engine: engine, maxHistoryTurns: 3);
 
       for (var i = 0; i < 5; i++) {

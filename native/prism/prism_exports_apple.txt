@@ -5,3 +5,9 @@ _bn_prompt
 _bn_next_token
 _bn_context_size
 _bn_meta
+_bn_abi_version
+_bn_set_sampling
+_bn_next_token_ex
+_bn_token_count
+_bn_set_abort_flag
+_bn_last_prompt_reused

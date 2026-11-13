@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
+import 'package:bitnet_flutter_ai/src/engine/bitnet_engine.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Splits the UTF-8 encoding of [text] into byte-slices at the given [cuts]

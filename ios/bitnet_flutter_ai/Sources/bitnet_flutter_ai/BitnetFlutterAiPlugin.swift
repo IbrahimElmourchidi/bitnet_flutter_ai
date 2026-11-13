@@ -1,24 +1,14 @@
 import Flutter
 import UIKit
 
+/// Registration shell only.
+///
+/// This target exists to link the vendored xcframeworks (see Package.swift /
+/// the podspec). The inference engine is reached from Dart through dart:ffi,
+/// and device queries (physical memory, thermal state, Low Power Mode,
+/// backup exclusion) through Objective-C interop via package:objective_c —
+/// see lib/src/device/apple/. There is no platform channel, so those calls
+/// also work from background isolates.
 public class BitnetFlutterAiPlugin: NSObject, FlutterPlugin {
-    public static func register(with registrar: FlutterPluginRegistrar) {
-        let channel = FlutterMethodChannel(
-            name: "bitnet_flutter_ai",
-            binaryMessenger: registrar.messenger()
-        )
-        let instance = BitnetFlutterAiPlugin()
-        registrar.addMethodCallDelegate(instance, channel: channel)
-    }
-
-    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        switch call.method {
-        case "getTotalRam":
-            // ProcessInfo.physicalMemory returns UInt64 (bytes).
-            // Cast to Int64 so it maps cleanly to Dart's int.
-            result(Int64(bitPattern: ProcessInfo.processInfo.physicalMemory))
-        default:
-            result(FlutterMethodNotImplemented)
-        }
-    }
+    public static func register(with registrar: FlutterPluginRegistrar) {}
 }

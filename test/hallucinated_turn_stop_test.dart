@@ -1,4 +1,5 @@
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
+import 'package:bitnet_flutter_ai/src/engine/bitnet_engine.dart';
 import 'package:bitnet_flutter_ai/src/session/chat_templates.dart';
 import 'package:flutter_test/flutter_test.dart';
 

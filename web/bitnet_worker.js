@@ -108,14 +108,30 @@ onmessage = async function (ev) {
         postMessage({ type: 'result', id: id, value: (h === null || h === undefined) ? null : h });
         break;
       }
+      case 'sampling': {
+        var s = Module.bn_set_sampling(msg.ctx, msg.temperature, msg.topK, msg.topP,
+                                       msg.repeatPenalty, msg.repeatLastN, msg.seed,
+                                       msg.grammar || '');
+        postMessage({ type: 'result', id: id, value: { ok: s.ok, error: s.error } });
+        break;
+      }
       case 'prompt': {
-        var rc = Module.bn_prompt(msg.ctx, msg.prompt, msg.addBos);
-        postMessage({ type: 'result', id: id, value: rc });
+        var p = Module.bn_prompt(msg.ctx, msg.prompt, msg.addBos);
+        postMessage({ type: 'result', id: id, value: { rc: p.rc, error: p.error } });
         break;
       }
       case 'next': {
+        // bytes: raw UTF-8 of the token piece (may be a partial character);
+        // transferred, not copied.
         var r = Module.bn_next_token(msg.ctx);
-        postMessage({ type: 'result', id: id, value: { done: r.done, token: r.token } });
+        var value = { done: r.done, bytes: r.bytes, logprob: r.logprob, error: r.error };
+        postMessage({ type: 'result', id: id, value: value },
+                    r.bytes ? [r.bytes.buffer] : []);
+        break;
+      }
+      case 'count': {
+        var n = Module.bn_token_count(msg.ctx, msg.text, msg.addBos);
+        postMessage({ type: 'result', id: id, value: n });
         break;
       }
       case 'free':

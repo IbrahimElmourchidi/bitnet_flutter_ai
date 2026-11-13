@@ -9,6 +9,127 @@ Pre-1.0.0 versions (`0.x.x-beta.y`) may introduce breaking changes between beta 
 
 ## Unreleased
 
+## 0.3.0-beta.1 — 2026-11-13
+
+> **Known limitations of this beta** (planned for 0.3.0 stable):
+> - The prebuilt **iOS xcframeworks are still ABI v1**, so 0.3.0 refuses to load
+>   them with a `BitNetLibraryLoadException`. Rebuild them on a Mac with
+>   `tool/build_ios.sh` + `tool/build_ios_prism.sh`.
+> - The prebuilt **Android/Linux `libprism_bridge.so`** is still ABI v1 and comes
+>   from a PrismML fork without `GGML_TYPE_Q2_0`, so Ternary Bonsai models don't
+>   load there. The default BitNet backend is rebuilt and verified on Android,
+>   Linux and Web.
+
+Requires **Dart 3.14 / Flutter 3.50** and the **bn C ABI v2** native libraries
+(rebuild with `tool/build_*.sh`; a stale library is refused with a clear
+`BitNetLibraryLoadException` instead of crashing).
+
+### Breaking changes (migration)
+
+- `BitNetEngine.generate(prompt, maxNewTokens:, addBos:)` →
+  `generate(prompt, options: GenerationOptions(maxNewTokens: …))`. The new
+  `generateTokens` streams `TokenEvent`s (text + per-token log-probabilities).
+- `BitNetSession(engine:, model:)` → the `model` parameter is gone; the
+  session reads `engine.model`, so the chat template always matches the loaded
+  weights. `systemPrompt:` can be passed to the constructor.
+- `BitNetSession.dispose()` removed — sessions do not own the engine (several
+  sessions may share one). Call `engine.dispose()`.
+- `defaultMaxNewTokens` → `options` (`GenerationOptions`).
+  `summarize(style: 'bullets')` → `summarize(style: SummaryStyle.bullets)`.
+  `BitNetRag.ask(maxNewTokens:)` → `ask(options:)`.
+- `BitNetBusyException` removed: overlapping generations are now queued in
+  call order instead of rejected.
+- `TurnStopDetector`, `Utf8StreamDecoder` and `kBitNetTurnStopMarkers` are no
+  longer exported (internal helpers).
+- Android plugin namespace `com.example.bitnet_flutter_ai` →
+  `org.utanium.bitnet_flutter_ai`.
+
+### Added
+
+- **Structured extraction:** `BitNetSession.extract(text, shape: JsonShape(…))`
+  with `JsonField.number/integer/string/boolean/enumOf/date`, worked
+  `ExtractExample`s and `today:` for relative dates. Output is constrained by a
+  GBNF grammar (always parses), decoded greedily, and returned as an
+  `ExtractResult` with an overall and per-field `confidence`.
+- `GenerationOptions` (temperature, top-k/p, repetition penalty, seed, GBNF
+  `grammar`, extra `stop` strings) with `GenerationOptions.precise()` for
+  deterministic structured output.
+- `BitNetEngine.countTokens`, `BitNetEngine.model`.
+- `BitNetSession.chat` trims history by **token budget** (context minus the
+  reply reserve), not just turn count, and raises
+  `BitNetPromptTooLongException` when a single message cannot fit.
+- **KV-cache prefix reuse:** a new prompt only prefills what differs from the
+  previous one, so a fixed system prompt / few-shot block is processed once
+  (measured 3–5× faster prefill on repeated extractions).
+- **Instant cancellation:** `cancelGeneration()` writes a shared native flag
+  the C layer polls during prefill and decode — no longer waits for the
+  current multi-second prefill to finish.
+- `DeviceInspector.health()` → `DeviceHealth` (total/available RAM, low-memory
+  flag, `ThermalState`, Low Power / battery saver, `shouldThrottle`).
+- **Dart 3.14 direct native interop:** Android device queries use JNIgen
+  bindings (`jnigen.yaml`), iOS/macOS use Foundation through
+  `package:objective_c`. The MethodChannel is gone, so device queries also work
+  from background isolates.
+- C ABI v2: `bn_abi_version`, `bn_set_sampling`, `bn_next_token_ex`,
+  `bn_token_count`, `bn_set_abort_flag`, `bn_last_prompt_reused`. Both
+  backends share one implementation (`native/bn_core.inc`).
+- `native/test/abi_v2_smoke.c` and the opt-in `test/real_model_test.dart`
+  (`BITNET_MODEL=…`) for end-to-end checks against real weights.
+
+### Fixed
+
+- **Generations could interleave on one native context**: cancelling a stream
+  and immediately starting another let both decode loops pull tokens from the
+  same context, corrupting the second reply. Generations are now serialised on
+  both sides of the isolate boundary.
+- Concurrent `load()` calls spawned several isolates; `dispose()` during
+  `load()` was undone when the load finished (leaking the model).
+- A dying inference isolate left `load()` / streams hanging forever; it now
+  fails them with `BitNetIsolateException` and unloads the engine.
+- The sampler's repetition-penalty history leaked from one prompt into the
+  next (no `llama_sampler_reset`).
+- PrismML backend: prompts over 2048 tokens failed (`n_batch` not raised).
+- Model download: a connection that closed early was accepted as complete
+  (pinned hash → full re-download from zero; unpinned → truncated model
+  loaded); a complete `.part` got HTTP 416 and could never finish; two
+  concurrent downloads appended to the same `.part`;
+  `BitNetHashMismatchException.actualHash` was the literal `'<computed>'`.
+- Models are stored outside device backups (Android `noBackupFilesDir`, with
+  a one-time migration; iOS `NSURLIsExcludedFromBackupKey`) — a >1 GB file in
+  the regular files dir exceeded Android Auto Backup's quota and made the
+  host app's whole backup fail.
+- Web: token pieces were decoded to strings per token, turning multi-byte
+  characters split across tokens (Arabic, emoji) into `�`. Raw bytes are now
+  reassembled as on native.
+- The bare `Human:` stop marker truncated replies that merely mentioned
+  "Human:" mid-sentence.
+- Unconditional `print` in `ModelCache` and per-prompt `stderr` logging in the
+  bridges (now behind `BitNetLog` / `BN_DEBUG_LOG`).
+
+### Example app
+
+- New **Extract** tab: expense parsing with `JsonShape`, few-shot examples,
+  per-field confidence bars and a "save / please confirm" verdict.
+- **Device health** card on the Device tab (`DeviceInspector.health()`).
+- Migrated to the Flutter 3.50 Android toolchain: Gradle 9.5.0, AGP 9.3.1,
+  built-in Kotlin, `compileSdk`/`targetSdk` 36; `package:material_ui`.
+- `integration_test/`: on-device checks (device health from the main and a
+  background isolate, backup-excluded model path, real-model extraction) and
+  an end-to-end UI flow (load → extract).
+
+### Tooling / requirements
+
+- Minimum **Dart 3.14 / Flutter 3.50**. Android host apps need Gradle 9.3.1+
+  (Flutter 3.50 requirement); the plugin's Android module is now Java-only and
+  builds under AGP 8 and AGP 9. `ffigen` 23, `flutter_lints` 6.
+- New dependencies: `jni`, `jni_flutter`, `objective_c` (dev: `jnigen`).
+- `.pubignore` keeps local docs out of the published package.
+
+### Removed
+
+- `tool/dart_smoke.dart` (could not run under plain `dart`; superseded by
+  `test/real_model_test.dart`).
+
 ## 0.2.0-beta.1 — 2026-08-11
 
 ### Added

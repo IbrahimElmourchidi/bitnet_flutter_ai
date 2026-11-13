@@ -1,53 +1,13 @@
-import 'dart:async';
 
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Tiny fake [BitNetEngine] that echoes a scripted reply back as a stream
-/// of single-character tokens. The most recent prompt it saw is recorded
-/// so tests can assert on prompt formatting.
-class _FakeEngine implements BitNetEngine {
-  String reply;
-  String? lastPrompt;
-  int? lastMaxNewTokens;
-  bool _loaded = true;
-
-  _FakeEngine({this.reply = 'ok'});
-
-  @override
-  bool get isLoaded => _loaded;
-
-  @override
-  Future<void> load({void Function(double progress)? onProgress}) async {
-    _loaded = true;
-  }
-
-  @override
-  Stream<String> generate(
-    String prompt, {
-    int maxNewTokens = 512,
-    bool addBos = true,
-  }) async* {
-    lastPrompt = prompt;
-    lastMaxNewTokens = maxNewTokens;
-    for (final ch in reply.split('')) {
-      yield ch;
-    }
-  }
-
-  @override
-  Future<void> cancelGeneration() async {}
-
-  @override
-  Future<void> dispose() async {
-    _loaded = false;
-  }
-}
+import 'support/fake_engine.dart';
 
 void main() {
   group('BitNetSession', () {
     test('chat appends user + assistant turns to history', () async {
-      final engine = _FakeEngine(reply: 'Hi there');
+      final engine = FakeEngine(reply: 'Hi there');
       final session = BitNetSession(engine: engine);
       final pieces = await session.chat('Hello').toList();
       expect(pieces.join(), 'Hi there');
@@ -59,9 +19,9 @@ void main() {
     });
 
     test('system prompt is included in formatted prompt', () async {
-      final engine = _FakeEngine();
-      final session = BitNetSession(engine: engine);
-      session.setSystemPrompt('You are helpful.');
+      final engine = FakeEngine();
+      final session =
+          BitNetSession(engine: engine, systemPrompt: 'You are helpful.');
       await session.chat('Hi').toList();
       // bitnetLabeled template: the system prompt is folded into the first
       // Human turn, and the prompt ends on an open assistant cue. No
@@ -76,7 +36,7 @@ void main() {
       // Simulate the reported failure: the engine streams a reply that runs on
       // into a fabricated user turn. Only the real answer must land in history,
       // so the next turn's prompt is not poisoned.
-      final engine = _FakeEngine(
+      final engine = FakeEngine(
         reply: 'Hello! I am BITNETAssistant.\n\n'
             'User: What are the best ways to reduce stress?\n'
             'ANSWER: Take a walk.',
@@ -90,7 +50,7 @@ void main() {
     });
 
     test('history is trimmed to maxHistoryTurns', () async {
-      final engine = _FakeEngine(reply: 'r');
+      final engine = FakeEngine(reply: 'r');
       final session = BitNetSession(engine: engine, maxHistoryTurns: 4);
       for (var i = 0; i < 6; i++) {
         await session.chat('msg $i').toList();
@@ -99,7 +59,7 @@ void main() {
     });
 
     test('summarize does not mutate history', () async {
-      final engine = _FakeEngine(reply: 'a short summary');
+      final engine = FakeEngine(reply: 'a short summary');
       final session = BitNetSession(engine: engine);
       final out = await session.summarize('long text here');
       expect(out, 'a short summary');
@@ -108,16 +68,16 @@ void main() {
     });
 
     test('summarize style picks the right instruction', () async {
-      final engine = _FakeEngine(reply: '-');
+      final engine = FakeEngine(reply: '-');
       final session = BitNetSession(engine: engine);
-      await session.summarize('text', style: 'bullets');
+      await session.summarize('text', style: SummaryStyle.bullets);
       expect(engine.lastPrompt, contains('bullet list'));
-      await session.summarize('text', style: 'tldr');
+      await session.summarize('text', style: SummaryStyle.tldr);
       expect(engine.lastPrompt, contains('TL;DR'));
     });
 
     test('assist with context injects retrieved snippets', () async {
-      final engine = _FakeEngine(reply: 'answer');
+      final engine = FakeEngine(reply: 'answer');
       final session = BitNetSession(engine: engine);
       final out = await session.assist(
         'What is BitNet?',
@@ -130,7 +90,7 @@ void main() {
     });
 
     test('assist without context falls back to plain QA template', () async {
-      final engine = _FakeEngine(reply: 'a');
+      final engine = FakeEngine(reply: 'a');
       final session = BitNetSession(engine: engine);
       await session.assist('hello?');
       expect(engine.lastPrompt, isNot(contains('### Context')));
@@ -138,7 +98,7 @@ void main() {
     });
 
     test('throws BitNetNotLoadedException when engine is not loaded', () {
-      final engine = _FakeEngine();
+      final engine = FakeEngine();
       engine.dispose();
       final session = BitNetSession(engine: engine);
       expect(
@@ -152,7 +112,7 @@ void main() {
     });
 
     test('clearHistory wipes turns but keeps system prompt', () async {
-      final engine = _FakeEngine();
+      final engine = FakeEngine();
       final session = BitNetSession(engine: engine);
       session.setSystemPrompt('S');
       await session.chat('hi').toList();
@@ -165,7 +125,7 @@ void main() {
 
   group('BitNetRag', () {
     test('ask retrieves relevant context and forwards to assist', () async {
-      final engine = _FakeEngine(reply: 'final answer');
+      final engine = FakeEngine(reply: 'final answer');
       final session = BitNetSession(engine: engine);
       final source = InMemoryKnowledgeSource(documents: [
         (source: 'kb', text: 'BitNet is a 1.58-bit LLM. Flutter is a UI toolkit.'),

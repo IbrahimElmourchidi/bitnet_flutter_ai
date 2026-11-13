@@ -4,14 +4,19 @@ import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
+import '../diagnostics/bitnet_log.dart';
 import '../exceptions/bitnet_exception.dart';
 import '../model/bitnet_model_info.dart';
+import 'cache_location_io.dart'
+    if (dart.library.js_interop) 'cache_location_web.dart';
 
 /// Downloads, verifies, and caches the GGUF model file on disk.
 ///
-/// Storage location: `<applicationSupportDirectory>/bitnet_flutter_ai/<filename>`
+/// Storage location: a backup-excluded app directory (see
+/// `modelCacheDirectory`): `getNoBackupFilesDir()/bitnet_flutter_ai` on
+/// Android, `<Application Support>/bitnet_flutter_ai` elsewhere (flagged
+/// excluded-from-backup on iOS/macOS).
 /// Partial downloads use a `.part` suffix and are resumed on retry.
 /// A successful SHA-256 check writes a `.verified` stamp beside the model so
 /// later loads skip re-hashing a multi-gigabyte file (see [_isStampValid]).
@@ -42,7 +47,26 @@ abstract final class ModelCache {
     BitNetModelInfo model, {
     required void Function(double progress) onProgress,
     http.Client? client,
-  }) async {
+  }) {
+    // Single flight per file: two engines (or a double-tapped "download"
+    // button) must not both append to the same `.part`. Later callers share
+    // the first call's future; their onProgress is not called.
+    final key = model.ggufFileName;
+    // Block body on purpose: `=> _inFlight.remove(key)` would return this very
+    // future to whenComplete, which then waits on itself forever.
+    return _inFlight[key] ??=
+        _ensureModel(model, onProgress, client).whenComplete(() {
+      _inFlight.remove(key);
+    });
+  }
+
+  static final Map<String, Future<String>> _inFlight = {};
+
+  static Future<String> _ensureModel(
+    BitNetModelInfo model,
+    void Function(double progress) onProgress,
+    http.Client? client,
+  ) async {
     final dir = await _cacheDir();
     await dir.create(recursive: true);
 
@@ -53,9 +77,8 @@ abstract final class ModelCache {
     // Fast path: file exists — verify hash, return if good.
     if (modelFile.existsSync()) {
       if (!model.hasPinnedHash) {
-        // ignore: avoid_print
-        print('[bitnet_flutter_ai] WARNING: SHA-256 not pinned for '
-            '${model.ggufFileName}. Skipping verification.');
+        BitNetLog.log('cache',
+            'WARNING: SHA-256 not pinned for ${model.ggufFileName}; not verified');
         return modelFile.path;
       }
       // Skip re-hashing when this exact file already passed. Hashing a 1.1 GB
@@ -64,7 +87,7 @@ abstract final class ModelCache {
       if (await _isStampValid(stampFile, modelFile, model.ggufSha256)) {
         return modelFile.path;
       }
-      final valid = await _verifySha256(modelFile, model.ggufSha256);
+      final (valid, _) = await _verifySha256(modelFile, model.ggufSha256);
       if (valid) {
         await _writeStamp(stampFile, modelFile, model.ggufSha256);
         return modelFile.path;
@@ -93,10 +116,10 @@ abstract final class ModelCache {
 
     // Post-download verification.
     if (model.hasPinnedHash) {
-      final valid = await _verifySha256(modelFile, model.ggufSha256);
+      final (valid, actual) = await _verifySha256(modelFile, model.ggufSha256);
       if (!valid) {
         // _verifySha256 already deleted the file.
-        throw BitNetHashMismatchException(model.ggufSha256, '<computed>');
+        throw BitNetHashMismatchException(model.ggufSha256, actual);
       }
       await _writeStamp(stampFile, modelFile, model.ggufSha256);
     }
@@ -169,7 +192,6 @@ abstract final class ModelCache {
     required http.Client client,
   }) async {
     final existingBytes = tempFile.existsSync() ? tempFile.lengthSync() : 0;
-    final totalBytes = model.ggufSizeBytes;
 
     final request = http.Request('GET', Uri.parse(model.ggufDownloadUrl));
     if (existingBytes > 0) {
@@ -183,20 +205,51 @@ abstract final class ModelCache {
       throw BitNetDownloadException('Network error during model download: $e');
     }
 
-    // 206 = partial content (resume), 200 = full download
+    // 416 on a resume: the `.part` already holds every byte (e.g. the app was
+    // killed between the last chunk and the rename). Promote it; the SHA-256
+    // check that follows decides whether it is actually good.
+    if (response.statusCode == 416 && existingBytes > 0) {
+      await response.stream.drain<void>();
+      onProgress(1.0);
+      await tempFile.rename(modelFile.path);
+      return;
+    }
     if (response.statusCode != 200 && response.statusCode != 206) {
+      await response.stream.drain<void>();
       throw BitNetDownloadException(
         'Unexpected HTTP status: ${response.statusCode}',
         httpStatusCode: response.statusCode,
       );
     }
 
-    // If server ignored Range header and returned 200, restart from zero.
-    final isResume = response.statusCode == 206;
+    // A 200 means the server ignored the Range header: start over. A 206 must
+    // continue exactly where the `.part` ends; one for any other offset would
+    // splice mismatched bytes, so drop the `.part` and let the retry start
+    // clean. (A 206 without Content-Range is non-conformant but trusted —
+    // the SHA-256 check still guards the result.)
+    final contentRange = response.headers['content-range'];
+    if (response.statusCode == 206 &&
+        contentRange != null &&
+        !contentRange.startsWith('bytes $existingBytes-')) {
+      await response.stream.drain<void>();
+      await _deleteIfExists(tempFile);
+      throw BitNetDownloadException(
+          'Server resumed at the wrong offset ($contentRange); restarting.');
+    }
+    final isResume = response.statusCode == 206 && existingBytes > 0;
+    final startBytes = isResume ? existingBytes : 0;
+
+    // Authoritative total: the server's, else the catalog's.
+    final totalFromRange = contentRange == null
+        ? null
+        : int.tryParse(contentRange.substring(contentRange.lastIndexOf('/') + 1));
+    final expectedTotal = isResume
+        ? (totalFromRange ?? model.ggufSizeBytes)
+        : (response.contentLength ?? model.ggufSizeBytes);
+
     final sink = tempFile.openWrite(
       mode: isResume ? FileMode.append : FileMode.write,
     );
-    final startBytes = isResume ? existingBytes : 0;
     var receivedBytes = 0;
     // Throttled so a consumer can drive a progress bar straight off this
     // callback without rebuilding once per network chunk (see _progressEpsilon).
@@ -206,9 +259,9 @@ abstract final class ModelCache {
       await for (final chunk in response.stream) {
         sink.add(chunk);
         receivedBytes += chunk.length;
-        if (totalBytes > 0) {
+        if (expectedTotal > 0) {
           final fraction =
-              ((startBytes + receivedBytes) / totalBytes).clamp(0.0, 1.0);
+              ((startBytes + receivedBytes) / expectedTotal).clamp(0.0, 1.0);
           if (fraction - lastReported >= _progressEpsilon || fraction >= 1.0) {
             lastReported = fraction;
             onProgress(fraction);
@@ -217,15 +270,25 @@ abstract final class ModelCache {
       }
     } catch (e) {
       await sink.close();
-      throw BitNetDownloadException('Stream error during model download: $e');
+      throw BitNetDownloadException(
+          'Stream error during model download (will resume): $e');
+    }
+    await sink.close();
+
+    // A connection that closes cleanly but early is NOT a finished download.
+    // Keep the `.part` so the next attempt resumes instead of re-fetching
+    // (or, unpinned, loading a truncated model).
+    final have = startBytes + receivedBytes;
+    if (expectedTotal > 0 && have < expectedTotal) {
+      throw BitNetDownloadException(
+          'Download incomplete: $have of $expectedTotal bytes (will resume)');
     }
 
-    await sink.close();
     // Always land on a final value, even when the byte total was unknown or the
     // last chunk fell inside the throttle window.
     if (lastReported < 1.0) onProgress(1.0);
 
-    // Atomic rename: only happens when download completed successfully.
+    // Atomic rename: only once every byte is on disk.
     await tempFile.rename(modelFile.path);
   }
 
@@ -233,20 +296,20 @@ abstract final class ModelCache {
   // SHA-256 verification
   // ---------------------------------------------------------------------------
 
-  /// Returns true if the file matches [expectedHex].
-  /// Deletes the file and returns false on mismatch.
+  /// Returns whether the file matches [expectedHex], plus the actual digest.
+  /// Deletes the file on mismatch.
   ///
   /// The hash runs on a short-lived background isolate: SHA-256 over a
   /// multi-gigabyte file is pure Dart CPU work, and on the calling isolate it
   /// blocks whatever runs there — for the default engine, the UI thread.
-  static Future<bool> _verifySha256(File file, String expectedHex) async {
+  static Future<(bool, String)> _verifySha256(File file, String expectedHex) async {
     // Bind the path to a local so the isolate closure captures only a String —
     // a File instance is not guaranteed to be sendable.
     final path = file.path;
     final actual = await Isolate.run(() => _hashFile(path));
-    if (actual == expectedHex) return true;
+    if (actual == expectedHex) return (true, actual);
     await _deleteIfExists(file);
-    return false;
+    return (false, actual);
   }
 
   /// Streams the file at [path] through SHA-256 and returns the hex digest.
@@ -311,8 +374,5 @@ abstract final class ModelCache {
   // Path helpers
   // ---------------------------------------------------------------------------
 
-  static Future<Directory> _cacheDir() async {
-    final support = await getApplicationSupportDirectory();
-    return Directory(p.join(support.path, 'bitnet_flutter_ai'));
-  }
+  static Future<Directory> _cacheDir() => modelCacheDirectory();
 }

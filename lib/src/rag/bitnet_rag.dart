@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import '../engine/generation_options.dart';
 import '../session/bitnet_session.dart';
 import 'bm25.dart';
 import 'knowledge_source.dart';
@@ -56,7 +57,7 @@ class BitNetRag {
   /// The retrieved context is also returned for UI / citation purposes.
   Future<RagAnswer> ask(
     String question, {
-    int? maxNewTokens,
+    GenerationOptions? options,
     int? k,
   }) async {
     final hits = await retrieve(question, k: k);
@@ -64,7 +65,7 @@ class BitNetRag {
     final answer = await session.assist(
       question,
       context: context.isEmpty ? null : context,
-      maxNewTokens: maxNewTokens,
+      options: options,
     );
     return RagAnswer(answer: answer, citations: hits);
   }

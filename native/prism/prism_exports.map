@@ -7,6 +7,12 @@
     bn_next_token;
     bn_context_size;
     bn_meta;
+    bn_abi_version;
+    bn_set_sampling;
+    bn_next_token_ex;
+    bn_token_count;
+    bn_set_abort_flag;
+    bn_last_prompt_reused;
   local:
     *;
 };

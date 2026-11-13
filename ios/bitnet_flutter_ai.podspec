@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'bitnet_flutter_ai'
-  s.version          = '0.1.0-beta.1'
+  s.version          = '0.3.0-beta.1'
   s.summary          = 'Run Microsoft BitNet b1.58 2B-4T locally on iOS.'
   s.description      = <<-DESC
     A Flutter plugin that runs BitNet b1.58 (I2_S) and PrismML Q2_0 models

@@ -42,3 +42,5 @@ native/merged-ios-*/
 
 # Claude Code local (per-machine) settings.
 .claude/settings.local.json
+step_by_step_build_guides/*
+.sisyphus/plans/concepts-guide-site.md

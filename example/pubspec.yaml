@@ -4,7 +4,7 @@ publish_to: 'none'
 version: 1.0.0
 
 environment:
-  sdk: ^3.5.0
+  sdk: ^3.14.0
   flutter: ">=3.24.0"
 
 dependencies:
@@ -12,9 +12,14 @@ dependencies:
     sdk: flutter
   bitnet_flutter_ai:
     path: ../
+  material_ui: ^1.11.0
 
 dev_dependencies:
   flutter_lints: ^4.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
 
 flutter:
   uses-material-design: true

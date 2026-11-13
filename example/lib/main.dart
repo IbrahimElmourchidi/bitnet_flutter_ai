@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:bitnet_flutter_ai/bitnet_flutter_ai.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 void main() {
   BitNetLog.enabled = true;
@@ -52,6 +52,7 @@ class _HomePageState extends State<HomePage> {
   BitNetSession? _session;
   BitNetRag? _rag;
   DeviceProfile? _profile;
+  DeviceHealth? _health;
   BitNetModelInfo _selectedModel = BitNetCatalog.defaultModel;
   // The model currently loaded into _session, or null if none. Distinct from
   // _selectedModel so the UI can detect when the selection has diverged and
@@ -71,7 +72,16 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _profileDevice();
+    _refreshHealth();
     _refreshCacheStatus();
+  }
+
+  /// Live memory / thermal / power snapshot (direct native interop — no
+  /// platform channel). Refreshed on demand from the Device tab.
+  Future<void> _refreshHealth() async {
+    final health = await DeviceInspector.instance.health();
+    if (!mounted) return;
+    setState(() => _health = health);
   }
 
   Future<void> _profileDevice() async {
@@ -105,7 +115,7 @@ class _HomePageState extends State<HomePage> {
       _rag = null;
       _loadedModel = null;
     });
-    await previous?.dispose();
+    await previous?.engine.dispose();
 
     final target = _selectedModel;
     final engine = BitNetEngine(model: target);
@@ -116,9 +126,11 @@ class _HomePageState extends State<HomePage> {
         if (!mounted) return;
         setState(() => _progress = p);
       });
-      final session = BitNetSession(engine: engine, model: target)
-        ..setSystemPrompt(
-            'You are a helpful, concise assistant running fully on-device.');
+      final session = BitNetSession(
+        engine: engine,
+        systemPrompt:
+            'You are a helpful, concise assistant running fully on-device.',
+      );
       final rag = BitNetRag(
         session: session,
         source: AssetKnowledgeSource(
@@ -129,7 +141,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) {
         // Widget went away while the model was loading — nothing will ever
         // dispose this session, so release the native context here.
-        await session.dispose();
+        await engine.dispose();
         return;
       }
       setState(() {
@@ -141,9 +153,8 @@ class _HomePageState extends State<HomePage> {
       // A download may have just completed — reflect it in the picker badges.
       _refreshCacheStatus();
     } catch (e) {
-      // Catches everything, not just BitNetException: a MissingPluginException
-      // from the RAM channel or any other stray error used to escape here and
-      // strand the UI on "Loading" with no message and no way to retry.
+      // Catches everything, not just BitNetException, so a stray error can
+      // never strand the UI on "Loading" with no message and no way to retry.
       await engine.dispose();
       if (!mounted) return;
       setState(() {
@@ -157,14 +168,14 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     // Fire-and-forget: dispose() is synchronous, but the session teardown must
     // still run so the native context (and its ~1 GB of weights) is freed.
-    _session?.dispose();
+    _session?.engine.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 5,
+      length: 6,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('BitNet Flutter AI'),
@@ -174,9 +185,10 @@ class _HomePageState extends State<HomePage> {
               child: _StatusChip(state: _state),
             ),
           ],
-          bottom: const TabBar(tabs: [
+          bottom: const TabBar(isScrollable: true, tabs: [
             Tab(text: 'Device'),
             Tab(text: 'Chat'),
+            Tab(text: 'Extract'),
             Tab(text: 'Summarise'),
             Tab(text: 'Ask (RAG)'),
             Tab(text: 'Logs'),
@@ -185,6 +197,8 @@ class _HomePageState extends State<HomePage> {
         body: TabBarView(children: [
           _DeviceTab(
             profile: _profile,
+            health: _health,
+            onRefreshHealth: _refreshHealth,
             compatibleModels: _compatibleModels,
             cachedStatus: _cachedStatus,
             selectedModel: _selectedModel,
@@ -196,6 +210,7 @@ class _HomePageState extends State<HomePage> {
             onLoad: _loadEngine,
           ),
           _ChatTab(session: _session),
+          _ExtractTab(session: _session),
           _SummariseTab(session: _session),
           _RagTab(rag: _rag),
           const _LogsTab(),
@@ -211,6 +226,8 @@ class _HomePageState extends State<HomePage> {
 
 class _DeviceTab extends StatelessWidget {
   final DeviceProfile? profile;
+  final DeviceHealth? health;
+  final VoidCallback onRefreshHealth;
   final List<BitNetModelInfo> compatibleModels;
   /// Downloaded-on-disk status keyed by model id. A missing key is treated as
   /// not-yet-known (cache scan still in flight).
@@ -225,6 +242,8 @@ class _DeviceTab extends StatelessWidget {
 
   const _DeviceTab({
     required this.profile,
+    required this.health,
+    required this.onRefreshHealth,
     required this.compatibleModels,
     required this.cachedStatus,
     required this.selectedModel,
@@ -260,12 +279,32 @@ class _DeviceTab extends StatelessWidget {
         ),
         const SizedBox(height: 12),
         _Card(
+          title: 'Device health',
+          children: [
+            if (health == null)
+              const _Kv('Status', 'reading…')
+            else ...[
+              _Kv('Available RAM', _gb(health!.availableRamBytes)),
+              _Kv('Low memory', _yesNo(health!.lowMemory)),
+              _Kv('Thermal', health!.thermal.name),
+              _Kv('Low power mode', _yesNo(health!.lowPowerMode)),
+              _Kv('Throttle heavy work', health!.shouldThrottle ? 'yes' : 'no'),
+            ],
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: onRefreshHealth,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('Refresh'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        _Card(
           title: 'Available models',
           children: [
-            // A plain ListTile rather than RadioListTile: the latter's
-            // groupValue/onChanged pair is deprecated in favour of a RadioGroup
-            // ancestor, which needs Flutter 3.32 — above this package's
-            // declared ">=3.24.0" floor.
+            // A plain ListTile acting as a radio row (tap to select).
             for (final m in BitNetCatalog.all)
               ListTile(
                 onTap: state == _LoadState.loading
@@ -352,6 +391,12 @@ class _DeviceTab extends StatelessWidget {
     );
   }
 }
+
+String _gb(int? bytes) => bytes == null
+    ? 'unknown'
+    : '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+
+String _yesNo(bool? v) => v == null ? 'unknown' : (v ? 'yes' : 'no');
 
 // ---------------------------------------------------------------------------
 // Chat tab
@@ -499,6 +544,226 @@ class _ChatTabState extends State<_ChatTab>
 }
 
 // ---------------------------------------------------------------------------
+// Extract tab — structured extraction with confidence (expense logging)
+// ---------------------------------------------------------------------------
+
+/// The shape a voice/text expense entry is turned into.
+const _expenseShape = JsonShape({
+  'amount': JsonField.number(description: 'Amount of money spent'),
+  'currency': JsonField.enumOf(['EGP', 'USD', 'EUR'],
+      description: 'Assume EGP when no currency is mentioned'),
+  'vendor': JsonField.string(
+      nullable: true, description: 'Shop, brand or payee, if named'),
+  'category': JsonField.enumOf([
+    'food',
+    'groceries',
+    'transport',
+    'utilities',
+    'shopping',
+    'health',
+    'other',
+  ]),
+  'date': JsonField.date(nullable: true, description: 'When it happened'),
+});
+
+const _expenseExamples = [
+  ExtractExample('paid 40 dollars for an uber this morning', {
+    'amount': 40,
+    'currency': 'USD',
+    'vendor': 'Uber',
+    'category': 'transport',
+    'date': '2026-11-13',
+  }),
+  ExtractExample('electricity bill 150', {
+    'amount': 150,
+    'currency': 'EGP',
+    'vendor': null,
+    'category': 'utilities',
+    'date': null,
+  }),
+  ExtractExample('bought vegetables and bread from Carrefour for 320', {
+    'amount': 320,
+    'currency': 'EGP',
+    'vendor': 'Carrefour',
+    'category': 'groceries',
+    'date': null,
+  }),
+];
+
+class _ExtractTab extends StatefulWidget {
+  final BitNetSession? session;
+  const _ExtractTab({required this.session});
+
+  @override
+  State<_ExtractTab> createState() => _ExtractTabState();
+}
+
+class _ExtractTabState extends State<_ExtractTab>
+    with AutomaticKeepAliveClientMixin {
+  final _ctrl =
+      TextEditingController(text: 'I spent 250 EGP at the supermarket yesterday');
+  ExtractResult? _result;
+  String? _error;
+  int? _ms;
+  bool _busy = false;
+
+  /// Below this confidence the app asks the user to confirm instead of saving.
+  static const _threshold = 0.5;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _run() async {
+    final session = widget.session;
+    if (session == null || _busy || _ctrl.text.trim().isEmpty) return;
+    setState(() {
+      _busy = true;
+      _result = null;
+      _error = null;
+    });
+    final sw = Stopwatch()..start();
+    try {
+      final r = await session.extract(
+        _ctrl.text,
+        shape: _expenseShape,
+        instructions: "Extract the expense from the user's sentence.",
+        examples: _expenseExamples,
+        today: DateTime.now(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _result = r;
+        _ms = sw.elapsedMilliseconds;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e is BitNetException ? e.message : '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
+    if (widget.session == null) return const _NotReady();
+    final r = _result;
+    final scheme = Theme.of(context).colorScheme;
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        TextField(
+          controller: _ctrl,
+          minLines: 2,
+          maxLines: 4,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            labelText: 'Expense, as you would say it',
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(
+            child: FilledButton(
+              onPressed: _busy ? null : _run,
+              child: Text(_busy ? 'Extracting…' : 'Extract'),
+            ),
+          ),
+          if (_busy) ...[
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => widget.session?.stop(),
+              icon: const Icon(Icons.stop),
+              label: const Text('Stop'),
+            ),
+          ],
+        ]),
+        const SizedBox(height: 8),
+        const Text(
+          'The first run processes the instructions and examples; later runs '
+          'reuse them from the KV cache and only read the new sentence.',
+          style: TextStyle(fontSize: 12),
+        ),
+        const SizedBox(height: 12),
+        if (_error != null)
+          Text(_error!, style: TextStyle(color: scheme.error)),
+        if (r != null)
+          _Card(
+            title: r.isConfident(_threshold)
+                ? 'Confident — save it'
+                : 'Please confirm: ${r.uncertainFields(_threshold).join(', ')}',
+            children: [
+              for (final MapEntry(:key, :value) in r.value.entries)
+                _FieldRow(
+                  name: key,
+                  value: value == null ? '—' : '$value',
+                  confidence: r.fieldConfidence[key] ?? 1,
+                  uncertain: (r.fieldConfidence[key] ?? 1) < _threshold,
+                ),
+              const Divider(),
+              _Kv('Overall confidence',
+                  '${(r.confidence * 100).toStringAsFixed(0)}%'),
+              if (_ms != null) _Kv('Time', '$_ms ms'),
+              const SizedBox(height: 4),
+              SelectableText(r.raw,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+            ],
+          ),
+      ],
+    );
+  }
+}
+
+class _FieldRow extends StatelessWidget {
+  final String name;
+  final String value;
+  final double confidence;
+  final bool uncertain;
+  const _FieldRow({
+    required this.name,
+    required this.value,
+    required this.confidence,
+    required this.uncertain,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(children: [
+        SizedBox(width: 80, child: Text(name, style: const TextStyle(fontSize: 13))),
+        Expanded(
+          child: Text(value,
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: uncertain ? scheme.error : null)),
+        ),
+        SizedBox(
+          width: 56,
+          child: LinearProgressIndicator(
+            value: confidence,
+            color: uncertain ? scheme.error : scheme.primary,
+          ),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 36,
+          child: Text('${(confidence * 100).toStringAsFixed(0)}%',
+              textAlign: TextAlign.right, style: const TextStyle(fontSize: 12)),
+        ),
+      ]),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Summarise tab
 // ---------------------------------------------------------------------------
 
@@ -519,7 +784,7 @@ class _SummariseTabState extends State<_SummariseTab>
         'model size and lets the network run on CPU without a GPU. The 2B-4T '
         'variant fits in roughly 1.1 GB on disk.',
   );
-  String _style = 'paragraph';
+  SummaryStyle _style = SummaryStyle.paragraph;
   String _output = '';
   bool _busy = false;
 
@@ -568,11 +833,11 @@ class _SummariseTabState extends State<_SummariseTab>
           ),
         ),
         const SizedBox(height: 12),
-        SegmentedButton<String>(
+        SegmentedButton<SummaryStyle>(
           segments: const [
-            ButtonSegment(value: 'paragraph', label: Text('Paragraph')),
-            ButtonSegment(value: 'bullets', label: Text('Bullets')),
-            ButtonSegment(value: 'tldr', label: Text('TL;DR')),
+            ButtonSegment(value: SummaryStyle.paragraph, label: Text('Paragraph')),
+            ButtonSegment(value: SummaryStyle.bullets, label: Text('Bullets')),
+            ButtonSegment(value: SummaryStyle.tldr, label: Text('TL;DR')),
           ],
           selected: {_style},
           onSelectionChanged: (s) => setState(() => _style = s.first),

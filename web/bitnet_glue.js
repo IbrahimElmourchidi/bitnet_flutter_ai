@@ -13,8 +13,11 @@
  * API on window.BitNetWasm (all async):
  *   provisionModel(url, fsPath, sizeBytes, onProgress) -> Promise<void>
  *   bn_init(fsPath, nCtx, nThreads)                    -> Promise<handle|null>
- *   bn_prompt(handle, prompt, addBos)                  -> Promise<int rc>
- *   bn_next_token(handle)                              -> Promise<{done, token}>
+ *   bn_set_sampling(handle, temp, topK, topP, repeat, lastN, seed, grammar)
+ *                                                      -> Promise<{ok, error}>
+ *   bn_prompt(handle, prompt, addBos)                  -> Promise<{rc, error}>
+ *   bn_next_token(handle)          -> Promise<{done, bytes: Uint8Array|null, logprob, error}>
+ *   bn_token_count(handle, text, addBos)               -> Promise<int>
  *   bn_free(handle)                                    -> Promise<void>
  *
  * window.BitNetWasmReady resolves to the same object once the worker is up.
@@ -50,8 +53,18 @@
         .then(function (v) { progressCb = null; return v; },
               function (e) { progressCb = null; throw e; });
     },
+    bn_set_sampling: function (ctx, temperature, topK, topP, repeatPenalty, repeatLastN, seed, grammar) {
+      return call('sampling', {
+        ctx: ctx, temperature: temperature, topK: topK, topP: topP,
+        repeatPenalty: repeatPenalty, repeatLastN: repeatLastN, seed: seed,
+        grammar: grammar,
+      });
+    },
     bn_prompt: function (ctx, prompt, addBos) {
       return call('prompt', { ctx: ctx, prompt: prompt, addBos: addBos });
+    },
+    bn_token_count: function (ctx, text, addBos) {
+      return call('count', { ctx: ctx, text: text, addBos: addBos });
     },
     bn_next_token: function (ctx) {
       return call('next', { ctx: ctx });
